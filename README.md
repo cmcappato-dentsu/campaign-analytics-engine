@@ -194,7 +194,7 @@ campaign-analytics-engine/
 │
 ├── config/                        # Configuraciones del proyecto
 │   ├── __init__.py
-│   ├── column_mapping.py          # Aliases y nombres canónicos
+│   ├── column_mapping.py          # Compatibilidad histórica de aliases
 │   ├── constants.py               # Constantes generales
 │   ├── thresholds.py              # Umbrales de análisis
 │   └── settings.py                # Rutas y configuración
@@ -208,8 +208,12 @@ campaign-analytics-engine/
 │   └── exploration.ipynb
 │
 ├── src/                           # Código fuente principal
+│   ├── sources/                   # Adaptadores por plataforma/fuente
+│   │   ├── registry.py            # Registro de fuentes disponibles
+│   │   └── google_ads.py          # Adaptador inicial
 │   ├── __init__.py
-│   ├── loader.py                  # Carga de archivos
+│   ├── loader.py                  # Entrada agnóstica de carga
+│   ├── presentation.py            # Nombres descriptivos para resultados
 │   ├── cleaner.py                 # Limpieza y normalización
 │   ├── metrics.py                 # Cálculo de métricas
 │   ├── eligibility.py             # Criterios de elegibilidad
@@ -224,7 +228,8 @@ campaign-analytics-engine/
 │   ├── __init__.py
 │   ├── test_loader.py
 │   ├── test_cleaner.py
-│   └── test_metrics.py
+│   ├── test_metrics.py
+│   └── test_presentation.py
 │
 ├── docs/                          # Documentación interna
 │
@@ -245,6 +250,29 @@ streamlit run app.py
 ```
 
 La aplicación se abrirá en el navegador predeterminado.
+
+La versión actual permite:
+
+- Cargar reportes de la fuente seleccionada en CSV, XLSX o XLS.
+- Procesar el adaptador inicial de Google Ads en español e inglés.
+- Consultar KPIs generales, performance por campaña y detalle diario.
+- Explorar evolución diaria, ranking de inversión, Pareto y eficiencia de campañas mediante gráficos interactivos.
+- Consultar y descargar resultados con nombres de columnas descriptivos.
+- Conservar moneda e importes de origen y sumar sus equivalentes en USD mediante cotizaciones públicas diarias.
+
+La agregación por campaña conserva la moneda del reporte. Si un archivo mezcla
+monedas, la aplicación evita mostrar inversión y CPA como un total comparable.
+
+La lógica común no depende de una plataforma concreta. Para sumar una nueva
+fuente, se agrega un adaptador en `src/sources/`, se registra en
+`src/sources/registry.py` y se implementa el mapeo de sus columnas al schema
+canónico. El selector de plataforma y el loader se alimentan de ese registro;
+la lógica de análisis no necesita cambios.
+
+Los importes se convierten a USD antes de calcular métricas monetarias. La
+aplicación consulta la cotización diaria pública de
+[ExchangeRate-API](https://www.exchangerate-api.com/docs/free) en cada análisis
+y muestra su fecha de actualización en pantalla.
 
 ---
 

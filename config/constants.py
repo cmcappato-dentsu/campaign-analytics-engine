@@ -9,6 +9,9 @@ REQUIRED_COLUMNS = [
 ]
 
 
+CANONICAL_COLUMNS = REQUIRED_COLUMNS.copy()
+
+
 # Columnas opcionales
 OPTIONAL_COLUMNS = [
     "campaign_status",
@@ -27,5 +30,20 @@ OPTIONAL_COLUMNS = [
 ]
 
 
-# Filas iniciales del reporte de ejemplo
-DEFAULT_HEADER_SKIPROWS = 2
+INTEGER_COLUMNS = [
+    "clicks",
+    "impressions",
+]
+
+
+DECIMAL_COLUMNS = [
+    "budget",
+    "conversions",
+    "conversion_value",
+    "spend",
+    "impression_share",
+    "lost_is_rank",
+    "lost_is_budget",
+]
+
+

@@ -8,27 +8,44 @@ def aggregate_by_campaign(df):
         "clicks": "sum",
         "impressions": "sum",
         "conversions": "sum",
-        "spend": "sum",
     }
 
-    if "conversion_value" in df.columns:
+    spend_column = "spend_usd" if "spend_usd" in df.columns else "spend"
+    aggregation_rules[spend_column] = "sum"
 
-        aggregation_rules[
-            "conversion_value"
-        ] = "sum"
+    conversion_value_column = (
+        "conversion_value_usd"
+        if "conversion_value_usd" in df.columns
+        else "conversion_value"
+    )
+    if conversion_value_column in df.columns:
+        aggregation_rules[conversion_value_column] = "sum"
 
-    return (
+    group_columns = ["campaign"]
+    if "currency" in df.columns and spend_column == "spend":
+        group_columns.append("currency")
+
+    result = (
         df.groupby(
-            "campaign",
-            as_index=False
+            group_columns,
+            as_index=False,
+            dropna=False,
         )
         .agg(aggregation_rules)
     )
+
+    return result
 
 
 def calculate_derived_metrics(df):
 
     df = df.copy()
+    spend_column = "spend_usd" if "spend_usd" in df.columns else "spend"
+    conversion_value_column = (
+        "conversion_value_usd"
+        if "conversion_value_usd" in df.columns
+        else "conversion_value"
+    )
 
     df["ctr"] = np.where(
         df["impressions"] > 0,
@@ -38,14 +55,14 @@ def calculate_derived_metrics(df):
 
     df["cpc"] = np.where(
         df["clicks"] > 0,
-        df["spend"] / df["clicks"],
+        df[spend_column] / df["clicks"],
         np.nan
     )
 
     df["cpm"] = np.where(
         df["impressions"] > 0,
         (
-            df["spend"] /
+            df[spend_column] /
             df["impressions"]
         ) * 1000,
         np.nan
@@ -59,15 +76,15 @@ def calculate_derived_metrics(df):
 
     df["cpa"] = np.where(
         df["conversions"] > 0,
-        df["spend"] / df["conversions"],
+        df[spend_column] / df["conversions"],
         np.nan
     )
 
-    if "conversion_value" in df.columns:
+    if conversion_value_column in df.columns:
 
         df["roas"] = np.where(
-            df["spend"] > 0,
-            df["conversion_value"] / df["spend"],
+            df[spend_column] > 0,
+            df[conversion_value_column] / df[spend_column],
             np.nan
         )
 

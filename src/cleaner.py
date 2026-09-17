@@ -41,11 +41,22 @@ def clean_dates(df):
 
     df = df.copy()
 
-    df["date"] = pd.to_datetime(
-        df["date"],
+    values = df["date"].astype("string").str.strip()
+    iso_mask = values.str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)
+
+    parsed_dates = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+    parsed_dates.loc[iso_mask] = pd.to_datetime(
+        values.loc[iso_mask],
+        format="%Y-%m-%d",
         errors="coerce",
-        dayfirst=True
     )
+    parsed_dates.loc[~iso_mask] = pd.to_datetime(
+        values.loc[~iso_mask],
+        errors="coerce",
+        dayfirst=True,
+    )
+
+    df["date"] = parsed_dates
 
     return df
 
@@ -71,20 +82,23 @@ def clean_numeric_columns(df):
         if column not in df.columns:
             continue
 
-        df[column] = df[column].replace(
-            ["--", "—", ""],
-            np.nan
-        )
+        values = df[column].astype("string").str.strip()
+        values = values.replace(["--", "—", "", "nan", "None"], np.nan)
+
+        # Los reportes de performance pueden exportar cantidades con
+        # separadores de miles (por ejemplo, "2,877" o "181,709.52").
+        values = values.str.replace(",", "", regex=False)
+        values = values.str.replace("%", "", regex=False)
 
         df[column] = pd.to_numeric(
-            df[column],
+            values,
             errors="coerce"
         )
 
     return df
 
 
-def clean_google_ads_report(df):
+def clean_report(df):
 
     df = df.copy()
 
@@ -97,3 +111,9 @@ def clean_google_ads_report(df):
     df = clean_numeric_columns(df)
 
     return df.reset_index(drop=True)
+
+
+def clean_google_ads_report(df):
+    """Compatibilidad para el nombre histórico del limpiador."""
+
+    return clean_report(df)

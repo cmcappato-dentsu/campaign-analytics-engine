@@ -1,2 +1,8 @@
-from column_mapping import COLUMN_ALIASES
-from constants import REQUIRED_COLUMNS, CANONICAL_COLUMNS, INTEGER_COLUMNS, DECIMAL_COLUMNS    
+"""Configuración pública del motor."""
+
+from .constants import OPTIONAL_COLUMNS, REQUIRED_COLUMNS
+
+__all__ = [
+    "OPTIONAL_COLUMNS",
+    "REQUIRED_COLUMNS",
+]
