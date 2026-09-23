@@ -16,6 +16,12 @@ from src.presentation import (
     format_percentage,
     to_display_frame,
 )
+from src.elegibility import evaluate_eligibility, get_eligible_campaigns, get_eligibility_summary
+from src.diagnostics import run_diagnostics, calculate_benchmark, build_persistence_tracker
+from src.outliers import run_outlier_detection
+from src.pareto import analyze_pareto_concentration
+from src.scoring import prioritize_findings
+from src.reporting import build_full_report, format_report_markdown, build_enhanced_report
 
 
 st.set_page_config(
@@ -66,6 +72,55 @@ finally:
 daily = result["daily"]
 campaign = result["campaign"]
 
+# --- DIAGNOSTIC PIPELINE ---
+# 1. Elegibilidad
+eligibility_df = evaluate_eligibility(campaign, daily)
+eligible_campaigns = get_eligible_campaigns(campaign, daily)["campaign"].tolist()
+
+# 2. Benchmark histórico (requiere histórico - por ahora usamos datos actuales como proxy)
+# TODO: En producción, cargar histórico de data/processed/history/
+df_benchmark = calculate_benchmark(daily) if len(daily) > 1 else None
+persistence_df = build_persistence_tracker(daily, df_benchmark) if df_benchmark is not None else None
+
+# 3. Diagnósticos
+diagnostics_findings = run_diagnostics(
+    campaign, daily, daily, df_benchmark, persistence_df
+)
+
+# 4. Outliers
+outlier_findings = run_outlier_detection(
+    campaign, daily, df_benchmark, eligible_campaigns=eligible_campaigns
+)
+
+# 5. Pareto
+pareto_analysis = analyze_pareto_concentration(campaign)
+
+# 6. Scoring y priorización
+all_findings = diagnostics_findings + outlier_findings
+scored_findings = prioritize_findings(all_findings, campaign, max_findings=5)
+
+# 7. Reporte completo (con LLM opcional)
+use_llm = st.sidebar.checkbox("🤖 Resumen ejecutivo con IA (Ollama)", value=False, help="Requiere Ollama local con modelo llama3.1:8b")
+insights, llm_narrative = build_enhanced_report(
+    campaign, daily, eligibility_df,
+    diagnostics_findings, outlier_findings,
+    pareto_analysis, scored_findings, result["currency"],
+    use_llm=use_llm
+)
+
+# Status LLM en sidebar
+if use_llm:
+    try:
+        from src.llm_client import LLMClient
+        client = LLMClient()
+        if client.is_available():
+            st.sidebar.success("✅ Ollama conectado")
+        else:
+            st.sidebar.warning("⚠️ Ollama no disponible (instalar/ejecutar modelo)")
+    except Exception:
+        st.sidebar.error("❌ Ollama no instalado (`pip install ollama`)")
+
+# --- KPIs GENERALES ---
 total_spend = daily["spend_usd"].sum()
 total_clicks = daily["clicks"].sum()
 total_impressions = daily["impressions"].sum()
@@ -94,9 +149,44 @@ bottom_row = st.columns(2)
 bottom_row[0].metric("CTR", format_percentage(ctr))
 bottom_row[1].metric("CPA en USD", format_currency(cpa))
 
-tab_charts, tab_campaigns, tab_daily = st.tabs(
-    ["Gráficos", "Por campaña", "Detalle diario"]
+# --- TABS ---
+tab_insights, tab_charts, tab_campaigns, tab_daily = st.tabs(
+    ["🎯 Insights", "📊 Gráficos", "📋 Por campaña", "📅 Detalle diario"]
 )
+
+with tab_insights:
+    st.subheader("Análisis automático - 9 preguntas clave")
+    
+    # Resumen de elegibilidad
+    elig_summary = get_eligibility_summary(eligibility_df)
+    with st.expander("📋 Elegibilidad de campañas para análisis", expanded=False):
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total campañas", elig_summary["total_campaigns"])
+        col2.metric("✅ Elegibles", elig_summary["eligible"])
+        col3.metric("🟡 Volumen insuficiente", elig_summary["insufficient_volume"])
+        col4.metric("🔴 Gasto sin resultados", elig_summary["spend_no_results"])
+        
+        st.dataframe(
+            eligibility_df[["campaign", "eligibility_status", "eligibility_reason", "is_eligible"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    # Renderizar insights (9 preguntas)
+    for insight in insights:
+        with st.container():
+            st.markdown(f"### {insight.question_number}. {insight.question}")
+            st.markdown(insight.answer)
+            st.divider()
+
+    # Botón descargar reporte completo
+    markdown_report = format_report_markdown(insights)
+    st.download_button(
+        "📥 Descargar reporte completo (Markdown)",
+        markdown_report.encode("utf-8"),
+        file_name="reporte_miau.md",
+        mime="text/markdown",
+    )
 
 with tab_charts:
     st.subheader("Evolución de performance")
@@ -198,7 +288,7 @@ with tab_charts:
         )
         st.altair_chart(scatter_chart, use_container_width=True)
 
-    st.subheader("Concentración de inversión y conversiones")
+    st.subheader("Concentración de inversión y conversiones (Pareto)")
     pareto = build_campaign_pareto(campaign)
     pareto_lines = pareto.melt(
         id_vars=["campaign_rank", "campaign"],
