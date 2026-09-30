@@ -76,7 +76,9 @@ def check_display_in_search(df_campaign: pd.DataFrame) -> list[DiagnosticFinding
     return findings
 
 
-def calculate_benchmark(df_history: pd.DataFrame, window: int = 4) -> pd.DataFrame:
+def calculate_benchmark(
+    df_history: pd.DataFrame, window: int = 4, quartile_segment: str | None = None
+) -> pd.DataFrame:
     """
     Calcula promedio móvil por campaña y métrica para benchmark histórico.
 
@@ -84,6 +86,8 @@ def calculate_benchmark(df_history: pd.DataFrame, window: int = 4) -> pd.DataFra
         df_history: DataFrame con columnas [campaign, date, ctr, cpc, cpa,
                     impression_share, conversions, conversion_rate, spend_usd]
         window: Ventana de semanas para promedio móvil (default 4)
+        quartile_segment: Segmento de cuartil (Q1, Q2, Q3, Q4) por volumen.
+            Si es None, calcula benchmark global (todos las campañas juntos).
 
     Returns:
         DataFrame con benchmark por campaña: campaign, metric, benchmark_value
@@ -101,6 +105,10 @@ def calculate_benchmark(df_history: pd.DataFrame, window: int = 4) -> pd.DataFra
     if not available_metrics:
         return pd.DataFrame(columns=["campaign", "metric", "benchmark_value"])
 
+    # Si se especifica segmento de cuartil, filtrar por ese segmento
+    if quartile_segment is not None:
+        df = df[df["quartile"] == quartile_segment].copy()
+
     results = []
     for campaign, group in df.groupby("campaign"):
         for metric in available_metrics:
@@ -114,6 +122,7 @@ def calculate_benchmark(df_history: pd.DataFrame, window: int = 4) -> pd.DataFra
                     "metric": metric,
                     "benchmark_value": benchmark,
                     "periods_used": len(recent),
+                    "quartile_segment": quartile_segment,
                 })
 
     return pd.DataFrame(results)
@@ -123,6 +132,7 @@ def check_benchmark_variations(
     df_campaign: pd.DataFrame,
     df_benchmark: pd.DataFrame,
     persistence_df: pd.DataFrame | None = None,
+    quartile_segments: dict | None = None,
 ) -> list[DiagnosticFinding]:
     """
     Reglas de benchmark histórico (Roadmap Etapa 2, punto 3).
@@ -135,61 +145,100 @@ def check_benchmark_variations(
     - Impression Share: caída >10pp → "perdiendo visibilidad"
     - Conversions/CVR: caída >30% con clics estables/subiendo → "problema landing/oferta"
 
-    Persistencia: debe sostenerse ≥2 cortes consecutivos (salvo outliers).
+    Persistencia: debe sustentarce ≥2 cortes consecutivos (salvo outliers).
+    quartile_segments: Diccionario opcional mapping campaign -> cuartil (Q1-Q4) para benchmarks segmentados.
     """
     findings = []
 
     if df_benchmark.empty:
         return findings
 
+    # Create benchmark map: campaign -> metric -> benchmark_value
     benchmark_map = df_benchmark.set_index(["campaign", "metric"])["benchmark_value"].to_dict()
+
+    # Create quartile-aware benchmark map if quartile_segments provided
+    if quartile_segments is not None:
+        # Build a map: campaign -> (metric -> benchmark_value for its quartile)
+        quartile_benchmark_map = {}
+        for campaign, quartile in quartile_segments.items():
+            # Find benchmarks for this campaign in its quartile
+            camp_benchmarks = df_benchmark[
+                (df_benchmark["campaign"] == campaign) & 
+                (df_benchmark["quartile_segment"] == quartile)
+            ]
+            if not camp_benchmarks.empty:
+                camp_map = camp_benchmarks.set_index(["campaign", "metric"])["benchmark_value"].to_dict()
+                quartile_benchmark_map[campaign] = camp_map
+        # We'll use quartile-specific benchmarks when available below
+    else:
+        quartile_benchmark_map = None
 
     for _, row in df_campaign.iterrows():
         campaign = row["campaign"]
 
         # CTR
         if "ctr" in row and pd.notna(row["ctr"]) and row["ctr"] > 0:
-            bench = benchmark_map.get((campaign, "ctr"))
+            # Try quartile-specific benchmark first, then global
+            bench = None
+            if quartile_benchmark_map and campaign in quartile_benchmark_map:
+                bench = quartile_benchmark_map[campaign].get("ctr")
+            if bench is None:
+                bench = benchmark_map.get((campaign, "ctr"))
             if bench and bench > 0:
                 var = (row["ctr"] - bench) / bench
                 _check_persistence_and_add(
                     findings, campaign, row["ctr"], bench, var,
-                    DiagnosticRules.CTR_HIGH, "CTR alto",
-                    DiagnosticRules.CTR_LOW, "CTR bajo",
+                    DiagnosticRules.CTR_HIGH, "CTR sobre el benchmark",
+                    DiagnosticRules.CTR_LOW, "CTR por debajo del benchmark",
                     CTR_VARIATION_THRESHOLD, persistence_df, "ctr"
                 )
 
         # CPC
         if "cpc" in row and pd.notna(row["cpc"]) and row["cpc"] > 0:
-            bench = benchmark_map.get((campaign, "cpc"))
+            # Try quartile-specific benchmark first, then global
+            bench = None
+            if quartile_benchmark_map and campaign in quartile_benchmark_map:
+                bench = quartile_benchmark_map[campaign].get("cpc")
+            if bench is None:
+                bench = benchmark_map.get((campaign, "cpc"))
             if bench and bench > 0:
                 var = (row["cpc"] - bench) / bench
                 if var > CPC_VARIATION_THRESHOLD:
                     _add_finding_if_persistent(
                         findings, campaign, row["cpc"], bench, var,
-                        DiagnosticRules.CPC_HIGH, "CPC alto",
-                        "El CPC subió {:.0%} vs benchmark ({:.2f} → {:.2f}). "
+                        DiagnosticRules.CPC_HIGH, "CPC sobre el benchmark",
+                        "El CPC subió {:.0%} sobre el benchmark ({:.2f} → {:.2f}). "
                         "Puede indicar mayor competencia o pérdida de calidad.",
                         persistence_df, "cpc"
                     )
 
         # CPA
         if "cpa" in row and pd.notna(row["cpa"]) and row["cpa"] > 0:
-            bench = benchmark_map.get((campaign, "cpa"))
+            # Try quartile-specific benchmark first, then global
+            bench = None
+            if quartile_benchmark_map and campaign in quartile_benchmark_map:
+                bench = quartile_benchmark_map[campaign].get("cpa")
+            if bench is None:
+                bench = benchmark_map.get((campaign, "cpa"))
             if bench and bench > 0:
                 var = (row["cpa"] - bench) / bench
                 if var > CPA_VARIATION_THRESHOLD:
                     _add_finding_if_persistent(
                         findings, campaign, row["cpa"], bench, var,
-                        DiagnosticRules.CPA_HIGH, "CPA alto",
-                        "El CPA subió {:.0%} vs benchmark ({:.2f} → {:.2f}). "
+                        DiagnosticRules.CPA_HIGH, "CPA sobre el benchmark",
+                        "El CPA subió {:.0%} sobre el benchmark ({:.2f} → {:.2f}). "
                         "Costo por conversión significativamente mayor al habitual.",
                         persistence_df, "cpa"
                     )
 
         # Impression Share
         if "impression_share" in row and pd.notna(row["impression_share"]):
-            bench = benchmark_map.get((campaign, "impression_share"))
+            # Try quartile-specific benchmark first, then global
+            bench = None
+            if quartile_benchmark_map and campaign in quartile_benchmark_map:
+                bench = quartile_benchmark_map[campaign].get("impression_share")
+            if bench is None:
+                bench = benchmark_map.get((campaign, "impression_share"))
             if bench and bench > 0:
                 drop = bench - row["impression_share"]
                 if drop > 0.10:  # 10 puntos porcentuales
@@ -201,9 +250,34 @@ def check_benchmark_variations(
                         persistence_df, "impression_share"
                     )
 
+        # Top Impression Share
+        if "top_impression_share" in row and pd.notna(row["top_impression_share"]):
+            if row["top_impression_share"] < 0.30:  # Menor a 30% = baja prominencia
+                _add_finding_if_persistent(
+                    findings, campaign, row["top_impression_share"], None, -row["top_impression_share"],
+                    DiagnosticRules.IMPRESSION_SHARE_DROP, "Baja Top Impression Share",
+                    "Top Impression Share bajo ({:.0%}). Las anuncios no aparecen en la posición principal.",
+                    persistence_df, "top_impression_share"
+                )
+
+        # Lost IS Budget
+        if "lost_is_budget" in row and pd.notna(row["lost_is_budget"]):
+            if row["lost_is_budget"] > 0.20:  # Mayor a 20% = presupuesto insuficiente
+                _add_finding_if_persistent(
+                    findings, campaign, row["lost_is_budget"], None, row["lost_is_budget"],
+                    DiagnosticRules.IMPRESSION_SHARE_DROP, "Lost IS Budget alto",
+                    "Lost IS Budget {:.0%}. Presupuesto insuficiente para capturar todas las impresiones.",
+                    persistence_df, "lost_is_budget"
+                )
+
         # Conversions drop
         if "conversions" in row and pd.notna(row["conversions"]):
-            bench = benchmark_map.get((campaign, "conversions"))
+            # Try quartile-specific benchmark first, then global
+            bench = None
+            if quartile_benchmark_map and campaign in quartile_benchmark_map:
+                bench = quartile_benchmark_map[campaign].get("conversions")
+            if bench is None:
+                bench = benchmark_map.get((campaign, "conversions"))
             if bench and bench > 0:
                 var = (row["conversions"] - bench) / bench
                 if var < -0.30:  # caída >30%
@@ -224,7 +298,12 @@ def check_benchmark_variations(
 
         # Conversion rate drop
         if "conversion_rate" in row and pd.notna(row["conversion_rate"]) and row["conversion_rate"] > 0:
-            bench = benchmark_map.get((campaign, "conversion_rate"))
+            # Try quartile-specific benchmark first, then global
+            bench = None
+            if quartile_benchmark_map and campaign in quartile_benchmark_map:
+                bench = quartile_benchmark_map[campaign].get("conversion_rate")
+            if bench is None:
+                bench = benchmark_map.get((campaign, "conversion_rate"))
             if bench and bench > 0:
                 var = (row["conversion_rate"] - bench) / bench
                 if var < -0.30:  # caída >30%
@@ -253,12 +332,12 @@ def _check_persistence_and_add(
     persistence_df: pd.DataFrame | None,
     metric: str,
 ):
-    """Helper para métricas con umbral bilateral (CTR alto/bajo)."""
+    """Helper para métricas con umbral bilateral (CTR sobre/por debajo del benchmark)."""
     if variation > threshold:
         _add_finding_if_persistent(
             findings, campaign, current, benchmark, variation,
             rule_id_high, name_high,
-            f"El CTR subió {variation:.0%} vs benchmark ({benchmark:.2%} → {current:.2%}). "
+            f"El CTR subió {variation:.0%} en {campaign} ({benchmark:.2f} → {current:.2f}). "
             f"Mayor interacción de lo habitual.",
             persistence_df, metric
         )
@@ -266,7 +345,7 @@ def _check_persistence_and_add(
         _add_finding_if_persistent(
             findings, campaign, current, benchmark, variation,
             rule_id_low, name_low,
-            f"El CTR bajó {abs(variation):.0%} vs benchmark ({benchmark:.2%} → {current:.2%}). "
+            f"El CTR bajó {abs(variation):.0%} en {campaign} ({benchmark:.2f} → {current:.2f}). "
             f"Menor interacción de lo habitual.",
             persistence_df, metric
         )
@@ -325,6 +404,8 @@ def _get_threshold_for_metric(metric: str) -> float:
         "impression_share": 0.10,
         "conversions": 0.30,
         "conversion_rate": 0.30,
+        "lost_is_budget": 0.10,
+        "top_impression_share": 0.15,
     }
     return thresholds.get(metric, 0.25)
 
@@ -349,7 +430,7 @@ def build_persistence_tracker(
     records = []
     for _, row in df.iterrows():
         campaign = row["campaign"]
-        for metric in ["ctr", "cpc", "cpa", "impression_share", "conversions", "conversion_rate"]:
+        for metric in ["ctr", "cpc", "cpa", "impression_share", "conversions", "conversion_rate", "lost_is_budget", "top_impression_share"]:
             if metric not in row or pd.isna(row[metric]):
                 continue
             bench = benchmark_map.get((campaign, metric))
@@ -378,6 +459,19 @@ def build_persistence_tracker(
             })
 
     return pd.DataFrame(records)
+
+
+
+
+
+def _assign_quartile(df: pd.DataFrame, column: str) -> pd.Series:
+    """
+    Asigna cuartiles a cada fila basándose en el valor de una columna.
+    Returns series with values Q1, Q2, Q3, Q4.
+    Q1 = top 25% (mayor volumen), Q4 = bottom 25% (menor volumen).
+    """
+    quartiles = pd.qcut(df[column], q=4, labels=["Q4", "Q3", "Q2", "Q1"])
+    return quartiles
 
 
 def run_diagnostics(

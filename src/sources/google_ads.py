@@ -39,6 +39,10 @@ COLUMN_ALIASES = {
         "Cuota de impresiones de búsqueda",
         "Search impression share",
     ],
+    "top_impression_share": [
+        "Porcentaje de impr. (absoluto parte sup.)",
+        "Absolute top impression share",
+    ],
     "lost_is_rank": [
         "Cuota de impresiones perdida por ranking",
         "Search lost IS (rank)",

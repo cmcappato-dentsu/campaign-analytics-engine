@@ -72,11 +72,16 @@ def format_decimal(value, decimals: int = 2) -> str:
 
 
 def format_currency(value, currency: str = "USD") -> str:
-    """Formatea un importe monetario con dos decimales."""
+    """Formatea un importe monetario con separador de miles siempre."""
 
     if pd.isna(value):
         return "—"
-    return f"{currency} {format_decimal(value)}"
+    abs_value = abs(float(value))
+    decimals = 2 if abs_value < 10000 else 0
+    formatted = f"{float(value):,.{decimals}f}"
+    # Spanish format: punto de miles, coma decimal
+    formatted = formatted.replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{currency} {formatted}"
 
 
 def format_percentage(value) -> str:
@@ -114,7 +119,7 @@ def to_display_frame(df: pd.DataFrame) -> pd.DataFrame:
         display[column] = display[column].map(format_percentage)
 
     if "conversions" in display.columns:
-        display["conversions"] = display["conversions"].map(format_decimal)
+        display["conversions"] = display["conversions"].map(format_integer)
     if "roas" in display.columns:
         display["roas"] = display["roas"].map(format_decimal)
     if "exchange_rate_to_usd" in display.columns:

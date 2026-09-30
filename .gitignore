@@ -19,3 +19,5 @@ Thumbs.db
 # Ignore all files inside data/input
 data/input/*
 !data/input/.gitkeep
+
+AGENTS.md

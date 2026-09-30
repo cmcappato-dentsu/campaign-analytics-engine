@@ -35,10 +35,19 @@ class CampaignInsight:
 
 
 def format_currency(value: float, currency: str = "USD") -> str:
-    """Formatea moneda."""
+    """Formatea moneda con separador de miles siempre.
+
+    - < 10000: 2 decimales (ej: USD 1.234,50)
+    - >= 10000: 0 decimales (ej: USD 15.000)
+    """
     if pd.isna(value):
         return "—"
-    return f"{currency} {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    abs_value = abs(float(value))
+    decimals = 2 if abs_value < 10000 else 0
+    formatted = f"{float(value):,.{decimals}f}"
+    # Spanish format: punto de miles, coma decimal
+    formatted = formatted.replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{currency} {formatted}"
 
 
 def format_percentage(value: float) -> str:
@@ -77,7 +86,7 @@ def generate_executive_summary(
         f"En el período analizado se invirtieron **{format_currency(total_spend)}** "
         f"generando **{format_number(total_impressions)} impresiones**, "
         f"**{format_number(total_clicks)} clics** (CTR: {format_percentage(ctr)}) y "
-        f"**{format_number(total_conversions, 1)} conversiones** "
+        f"**{format_number(total_conversions)} conversiones** "
         f"(CPA: {format_currency(cpa) if cpa else 'N/A'}, Tasa conversión: {format_percentage(cvr)}).",
         f"",
     ]
@@ -114,7 +123,7 @@ def generate_top_campaigns_summary(
     ])
 
     for _, row in top_conv.iterrows():
-        lines.append(f"- **{row['campaign']}**: {format_number(row['conversions'], 1)} conv. ({row['conversions']/df_campaign['conversions'].sum()*100:.1f}% del total)")
+        lines.append(f"- **{row['campaign']}**: {format_number(row['conversions'])} conv. ({row['conversions']/df_campaign['conversions'].sum()*100:.1f}% del total)")
 
     return "\n".join(lines)
 
@@ -186,7 +195,7 @@ def generate_scale_opportunities(
                 row = df_campaign[df_campaign["campaign"] == c]
                 if not row.empty:
                     r = row.iloc[0]
-                    lines.append(f"   - **{c}**: {format_number(r['conversions'], 1)} conv, CPA {format_currency(r.get('cpa', 0))}, inversión actual {format_currency(r['spend_usd'])}")
+                    lines.append(f"   - **{c}**: {format_number(r['conversions'])} conv, CPA {format_currency(r.get('cpa', 0))}, inversión actual {format_currency(r['spend_usd'])}")
         lines.append(f"")
 
     # Campañas con buen ROAS y limitadas por presupuesto (impression share perdido por presupuesto)
@@ -274,13 +283,13 @@ def generate_high_cpa_insight(
     if cpa_findings:
         lines.append(f"🔴 **CPA significativamente por encima del benchmark histórico**:")
         for f in cpa_findings:
-            lines.append(f"   - {f.message}")
+            lines.append(f"   - **{f.campaign}**: {f.message}")
         lines.append(f"")
 
     if cpa_outliers:
         lines.append(f"🔴 **Outliers críticos de CPA** (variación >2x umbral normal):")
         for f in cpa_outliers:
-            lines.append(f"   - {f.message}")
+            lines.append(f"   - **{f.campaign}**: {f.message}")
         lines.append(f"")
 
     # Top CPA actual
@@ -289,7 +298,7 @@ def generate_high_cpa_insight(
         if not top_cpa.empty:
             lines.append(f"📊 **Top 3 CPA actual en la cuenta**:")
             for _, row in top_cpa.iterrows():
-                lines.append(f"   - **{row['campaign']}**: CPA {format_currency(row['cpa'])}, {format_number(row['conversions'], 1)} conv.")
+                lines.append(f"   - **{row['campaign']}**: CPA {format_currency(row['cpa'])}, {format_number(row['conversions'])} conv.")
         lines.append(f"")
 
     if not cpa_findings and not cpa_outliers:
@@ -503,6 +512,128 @@ def format_report_markdown(insights: list[CampaignInsight]) -> str:
     return "\n".join(lines)
 
 
+def generate_template_executive_summary(
+    insights: list[CampaignInsight],
+    df_campaign: pd.DataFrame,
+    scored_findings: list | None = None,
+) -> str:
+    """
+    Genera resumen ejecutivo narrativo usando templates locales (sin IA).
+    Estructura obligatoria siguiendo las 9 preguntas del roadmap.
+    """
+    # Extraer KPIs globales
+    total_spend = df_campaign["spend_usd"].sum()
+    total_conv = df_campaign["conversions"].sum()
+    total_clicks = int(df_campaign["clicks"].sum())
+    total_impr = int(df_campaign["impressions"].sum())
+    ctr = total_clicks / total_impr if total_impr > 0 else 0
+    cpa = total_spend / total_conv if total_conv > 0 else 0
+
+    # Helper para buscar insights por palabras clave
+    def find_insights(keywords):
+        found = []
+        for ins in insights:
+            ans = getattr(ins, "answer", "").lower()
+            if any(kw.lower() in ans for kw in keywords):
+                found.append(ins)
+        return found
+
+    def extract_msg(insights_list, max_chars=120):
+        return "; ".join([getattr(i, "answer", "")[:max_chars] for i in insights_list[:3]])
+
+    # Construir secciones
+    sections = []
+
+    # 1. QUÉ PASÓ
+    sections.append(
+        f"**1. QUÉ PASÓ**: Inversión total ${total_spend:,.0f} | "
+        f"{total_impr:,} impresiones | {total_clicks:,} clics (CTR {ctr:.1%}) | "
+        f"{total_conv:.1f} conversiones (CPA ${cpa:,.0f})"
+    )
+
+    # 2. CONCENTRACIÓN (Pareto)
+    pareto_top = df_campaign.nlargest(5, "spend_usd")
+    spend_pct = (
+        pareto_top["spend_usd"].sum() / total_spend * 100
+        if total_spend > 0 else 0
+    )
+    conv_pct = (
+        pareto_top["conversions"].sum() / total_conv * 100
+        if total_conv > 0 else 0
+    )
+    pareto_lines = "; ".join(
+        f"{r['campaign']}: ${r['spend_usd']:,.0f} ({r['conversions']:.1f} conv)"
+        for _, r in pareto_top.iterrows()
+    )
+    sections.append(
+        f"**2. CONCENTRACIÓN**: Top 5 = {spend_pct:.0f}% gasto, "
+        f"{conv_pct:.0f}% conv | {pareto_lines}"
+    )
+
+    # 3. DESPERDICIO
+    disp = find_insights(["display", "red de display"])
+    spend_nr = find_insights(["gasto sin", "sin clic", "sin convers"])
+    waste_parts = []
+    if disp: waste_parts.append(f"Display en Search: {len(disp)} campaña(s)")
+    if spend_nr: waste_parts.append(f"Gasto sin resultados: {len(spend_nr)} campaña(s)")
+    sections.append(
+        f"**3. DESPERDICIO**: {'; '.join(waste_parts) if waste_parts else 'Sin desperdicios detectados'}"
+    )
+
+    # 4. ESCALA
+    scale = find_insights(["escal", "oportunidad", "pareto oportunidad"])
+    sections.append(
+        f"**4. ESCALA**: {extract_msg(scale) if scale else 'Sin oportunidades claras'}"
+    )
+
+    # 5. VISIBILIDAD
+    vis = find_insights(["visibilidad", "impression share", "impr share", "cuota de impres"])
+    sections.append(
+        f"**5. VISIBILIDAD**: {extract_msg(vis) if vis else 'Sin pérdidas significativas de IS'}"
+    )
+
+    # 6. CLICS VS CONVERSIONES
+    ctr_f = find_insights(["ctr", "tasa de clic"])
+    cvr_f = find_insights(["tasa de convers", "conversion rate", "conversiones vs"])
+    click_conv_parts = []
+    if ctr_f: click_conv_parts.append(f"CTR: {len(ctr_f)} variación(es)")
+    if cvr_f: click_conv_parts.append(f"Tasa conv: {len(cvr_f)} variación(es)")
+    sections.append(
+        f"**6. CLICS VS CONV**: {'; '.join(click_conv_parts) if click_conv_parts else 'CTR y tasa conv en rangos normales'}"
+    )
+
+    # 7. CPA ALTO
+    cpa_f = find_insights(["cpa alto", "cpa elevad", "costo por resultado", "sobre benchmark"])
+    sections.append(
+        f"**7. CPA ALTO**: {extract_msg(cpa_f) if cpa_f else 'CPAs en rangos normales'}"
+    )
+
+    # 8. DATOS INSUFICIENTES
+    insuff = find_insights(["insuficiente", "esperar", "pocos datos"])
+    sections.append(
+        f"**8. DATOS INSUFICIENTES**: {extract_msg(insuff) if insuff else 'Todas con datos suficientes'}"
+    )
+
+    # 9. TOP HALLAZGOS
+    if scored_findings:
+        findings_text = []
+        for i, f in enumerate(scored_findings[:5], 1):
+            outlier = " ⚡" if getattr(f, "is_outlier", False) else ""
+            findings_text.append(
+                f"{i}. {f.rule_name} ({f.campaign}){outlier}: {f.message[:120]}"
+            )
+        sections.append(
+            "**9. TOP 5 HALLAZGOS**:\n" + "\n".join(findings_text)
+        )
+    else:
+        top_h = find_insights(["top ", "hallazg", "relevant"])
+        sections.append(
+            f"**9. TOP HALLAZGOS**: {extract_msg(top_h) if top_h else 'Ver lista completa'}"
+        )
+
+    return "\n\n".join(sections)
+
+
 def build_enhanced_report(
     df_campaign: pd.DataFrame,
     df_daily: pd.DataFrame,
@@ -513,9 +644,10 @@ def build_enhanced_report(
     scored_findings: list,
     currency_info: dict,
     use_llm: bool = True,
+    api_key: str | None = None,
 ) -> tuple[list[CampaignInsight], Optional[str]]:
     """
-    Construye reporte completo + narrativa ejecutiva opcional con LLM.
+    Construye reporte completo + narrativa ejecutiva opcional con LLM (Groq).
     Retorna (insights, llm_narrative_or_none).
     """
     # 1. Reporte base (9 preguntas)
@@ -528,14 +660,18 @@ def build_enhanced_report(
     # 2. Narrativa LLM (opcional, solo si está disponible y habilitado)
     llm_narrative = None
     if use_llm and LLM_AVAILABLE:
-        llm_narrative = generate_llm_narrative(scored_findings, df_campaign)
+        llm_narrative = generate_llm_narrative(
+            insights, df_campaign, 
+            scored_findings=scored_findings,
+            api_key=api_key,
+        )
         if llm_narrative:
             # Insertar como insight 0 (resumen ejecutivo narrativo)
             insights.insert(0, CampaignInsight(
                 question_number=0,
                 question="📋 Resumen Ejecutivo (IA)",
                 answer=llm_narrative,
-                supporting_data={"generated_by": "llm"},
+                supporting_data={"generated_by": "llm-groq"},
                 chart_type=None,
             ))
 

@@ -25,6 +25,7 @@ OPTIONAL_COLUMNS = [
     "network",
     "bid_strategy",
     "impression_share",
+    "top_impression_share",
     "lost_is_rank",
     "lost_is_budget",
 ]
@@ -42,6 +43,7 @@ DECIMAL_COLUMNS = [
     "conversion_value",
     "spend",
     "impression_share",
+    "top_impression_share",
     "lost_is_rank",
     "lost_is_budget",
 ]

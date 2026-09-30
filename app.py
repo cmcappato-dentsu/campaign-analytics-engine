@@ -2,6 +2,10 @@ import streamlit as st
 import altair as alt
 import os
 from tempfile import NamedTemporaryFile
+from dotenv import load_dotenv
+
+# Cargar variables de entorno desde .env
+load_dotenv()
 
 from src.analysis import (
     build_campaign_pareto,
@@ -36,23 +40,25 @@ st.write(
     "Motor de análisis automatizado de campañas."
 )
 
-sources = available_sources()
-source_id = st.selectbox(
-    "Plataforma",
-    options=list(sources),
-    format_func=lambda value: sources[value].label,
-)
-source = sources[source_id]
+# --- SELECCIÓN DE PLATAFORMA Y UPLOAD EN SIDEBAR (colapsible nativo ☰) ---
+with st.sidebar:
+    sources = available_sources()
+    source_id = st.selectbox(
+        "Plataforma",
+        options=list(sources),
+        format_func=lambda value: sources[value].label,
+    )
+    source = sources[source_id]
 
-uploaded_file = st.file_uploader(
-    "Cargá un reporte",
-    type=[extension.lstrip(".") for extension in source.extensions],
-    help="El formato y las columnas se interpretan según la fuente seleccionada.",
-)
+    uploaded_file = st.file_uploader(
+        "Cargá un reporte",
+        type=[extension.lstrip(".") for extension in source.extensions],
+        help="El formato y las columnas se interpretan según la fuente seleccionada.",
+    )
 
-if uploaded_file is None:
-    st.info("Subí un archivo CSV o Excel para comenzar el análisis.")
-    st.stop()
+    if uploaded_file is None:
+        st.info("Subí un archivo CSV o Excel para comenzar el análisis.")
+        st.stop()
 
 suffix = "." + uploaded_file.name.rsplit(".", 1)[-1].lower()
 
@@ -68,6 +74,35 @@ except (ValueError, FileNotFoundError) as error:
 finally:
     if "temporary_path" in locals() and os.path.exists(temporary_path):
         os.unlink(temporary_path)
+
+# 🤖 Resumen Ejecutivo con IA (después de carga, antes de KPIs)
+st.subheader("🤖 Resumen Ejecutivo con IA")
+use_llm = st.checkbox(
+    "Generar resumen ejecutivo con IA (Groq)",
+    value=False,
+    help="Usa Groq (cloud, gratis, rápido). Requiere GROQ_API_KEY en .env o Secrets."
+)
+api_key = None
+if use_llm:
+    # Prioridad: 1) Streamlit Secrets (producción) 2) .env (local)
+    secrets_key = ""
+    try:
+        secrets_key = st.secrets.get("GROQ_API_KEY", "")
+    except Exception:
+        pass
+    env_key = os.getenv("GROQ_API_KEY", "")
+    
+    if secrets_key:
+        api_key = secrets_key
+        st.success("✅ API key configurada (Secrets)")
+    elif env_key:
+        api_key = env_key
+        st.success("✅ API key configurada (.env)")
+    else:
+        st.error("❌ Falta GROQ_API_KEY. Agregala a .env local o Secrets en producción.")
+        use_llm = False
+
+st.divider()
 
 daily = result["daily"]
 campaign = result["campaign"]
@@ -100,25 +135,13 @@ all_findings = diagnostics_findings + outlier_findings
 scored_findings = prioritize_findings(all_findings, campaign, max_findings=5)
 
 # 7. Reporte completo (con LLM opcional)
-use_llm = st.sidebar.checkbox("🤖 Resumen ejecutivo con IA (Ollama)", value=False, help="Requiere Ollama local con modelo llama3.1:8b")
 insights, llm_narrative = build_enhanced_report(
     campaign, daily, eligibility_df,
     diagnostics_findings, outlier_findings,
     pareto_analysis, scored_findings, result["currency"],
-    use_llm=use_llm
+    use_llm=use_llm,
+    api_key=api_key,
 )
-
-# Status LLM en sidebar
-if use_llm:
-    try:
-        from src.llm_client import LLMClient
-        client = LLMClient()
-        if client.is_available():
-            st.sidebar.success("✅ Ollama conectado")
-        else:
-            st.sidebar.warning("⚠️ Ollama no disponible (instalar/ejecutar modelo)")
-    except Exception:
-        st.sidebar.error("❌ Ollama no instalado (`pip install ollama`)")
 
 # --- KPIs GENERALES ---
 total_spend = daily["spend_usd"].sum()
@@ -360,14 +383,14 @@ with tab_charts:
         .mark_circle(opacity=0.75)
         .encode(
             x=alt.X(
-                "ctr:Q",
-                title="CTR",
-                axis=alt.Axis(format=".1%"),
-            ),
-            y=alt.Y(
                 "cpa:Q",
                 title="CPA en USD",
                 axis=alt.Axis(format=",.2f"),
+            ),
+            y=alt.Y(
+                "ctr:Q",
+                title="CTR",
+                axis=alt.Axis(format=".1%"),
             ),
             size=alt.Size("spend_usd:Q", title="Inversión en USD"),
             tooltip=[
