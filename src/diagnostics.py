@@ -51,6 +51,7 @@ def check_display_in_search(df_campaign: pd.DataFrame) -> list[DiagnosticFinding
     Roadmap Etapa 2, punto 2 - Flag inmediato de alta prioridad.
     """
     findings = []
+    seen_campaigns = set()
 
     if "network" not in df_campaign.columns:
         return findings
@@ -59,7 +60,11 @@ def check_display_in_search(df_campaign: pd.DataFrame) -> list[DiagnosticFinding
         network = str(row.get("network", "")).lower()
         campaign = row["campaign"]
 
-        if "display" in network or "content" in network:
+        if campaign in seen_campaigns:
+            continue
+
+        if "display" in network or "content" in network or "contenido" in network:
+            seen_campaigns.add(campaign)
             findings.append(DiagnosticFinding(
                 campaign=campaign,
                 rule_id=DiagnosticRules.DISPLAY_IN_SEARCH,
@@ -497,7 +502,8 @@ def run_diagnostics(
     all_findings = []
 
     # 1. Reglas de configuración (siempre)
-    all_findings.extend(check_display_in_search(df_campaign))
+    config_df = df_campaign if "network" in df_campaign.columns else df_daily
+    all_findings.extend(check_display_in_search(config_df))
 
     # 2. Reglas de benchmark (requieren histórico)
     if df_history is not None and not df_history.empty:
