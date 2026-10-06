@@ -246,9 +246,50 @@ tab_insights, tab_charts, tab_campaigns, tab_daily = st.tabs(
 )
 
 with tab_insights:
-    st.subheader("Análisis automático - 9 preguntas clave")
-    
-    # Resumen de elegibilidad
+    status_meta = {
+        "critical": ("🔴", "Acción urgente", "#e03131", "#fff5f5"),
+        "warning": ("🟡", "Para revisar", "#f08c00", "#fff9db"),
+        "ok": ("🟢", "En orden", "#2f9e44", "#ebfbee"),
+        "info": ("🔵", "Informativo", "#1c7ed6", "#e7f5ff"),
+    }
+
+    def _insight_card(insight):
+        icon, label, color, background = status_meta.get(
+            insight.status, status_meta["info"]
+        )
+        card_title = insight.title or insight.question
+        anchor = f"insight-{insight.question_number}"
+        return f"""
+        <a href="#{anchor}" style="text-decoration: none; color: inherit;">
+        <div style="
+            border-left: 5px solid {color};
+            background-color: {background};
+            border-radius: 8px;
+            padding: 7px 10px;
+            margin-bottom: 6px;
+            min-height: 68px;
+            cursor: pointer;
+            transition: box-shadow 0.15s ease;
+        ">
+            <div style="font-size: 0.62rem; color: #868e96; text-transform: uppercase; letter-spacing: 0.5px;">
+                Pregunta {insight.question_number}
+            </div>
+            <div style="font-weight: 600; color: #343a40; font-size: 0.82rem; line-height: 1.2; margin: 1px 0 4px;">
+                {card_title}
+            </div>
+            <div style="font-size: 0.72rem; color: {color}; font-weight: 600;">
+                {icon} {label}
+            </div>
+        </div>
+        </a>
+        """
+
+    st.markdown("## 🎯 Lectura rápida de la cuenta")
+    st.caption(
+        "Cada bloque responde una pregunta clave y te marca de un vistazo si hay que actuar."
+    )
+
+    # Resumen de elegibilidad (primero, contexto de qué campañas entran al análisis)
     elig_summary = get_eligibility_summary(eligibility_df)
     with st.expander("📋 Elegibilidad de campañas para análisis", expanded=False):
         col1, col2, col3, col4 = st.columns(4)
@@ -256,7 +297,7 @@ with tab_insights:
         col2.metric("✅ Elegibles", elig_summary["eligible"])
         col3.metric("🟡 Volumen insuficiente", elig_summary["insufficient_volume"])
         col4.metric("🔴 Gasto sin resultados", elig_summary["spend_no_results"])
-        
+
         st.dataframe(
             eligibility_df[["campaign", "eligibility_status", "eligibility_reason", "is_eligible"]],
             use_container_width=True,
@@ -281,28 +322,63 @@ with tab_insights:
             "cpa": "CPA (USD)",
             "conversion_rate": "Tasa de conversión",
         }
+        lower_is_better = {"cpc", "cpa"}
         rows = []
         for metric, target in active_targets.items():
             actual = actuals.get(metric)
             deviation = (actual - target) / target if actual is not None and target else None
             is_rate = metric in ("ctr", "conversion_rate")
+            if deviation is None:
+                estado = "—"
+            elif abs(deviation) <= 0.10:
+                estado = "🟢 En objetivo"
+            elif (metric in lower_is_better and deviation < 0) or (metric not in lower_is_better and deviation > 0):
+                estado = "🟢 Mejor que objetivo"
+            else:
+                estado = "🔴 Fuera de objetivo"
             rows.append({
                 "Métrica": labels[metric],
                 "Real": f"{actual:.2%}" if is_rate and actual is not None else (f"{actual:,.2f}" if actual is not None else "—"),
                 "Objetivo": f"{target:.2%}" if is_rate else f"{target:,.2f}",
                 "Desvío vs objetivo": f"{deviation:+.1%}" if deviation is not None else "—",
+                "Estado": estado,
             })
         comparison = pd.DataFrame(rows)
-        st.subheader("🎯 Objetivos vs performance")
+        st.markdown("### 🎯 Objetivos vs performance")
+        st.caption(
+            "Compara lo real contra tus metas. 🟢 = en objetivo o mejor; "
+            "🔴 = te alejaste y conviene revisarlo."
+        )
         st.dataframe(comparison, use_container_width=True, hide_index=True)
-        st.caption("El desvío indica cuánto te alejaste de tu objetivo: positivo = por encima, negativo = por debajo.")
 
-    # Renderizar insights (9 preguntas)
+    summary_insights = [i for i in insights if i.question_number > 0]
+
+    st.markdown("### 🔎 Resumen de un vistazo")
+    st.caption(
+        "Semáforo de las 9 preguntas. Hacé clic en cualquier tarjeta para ir al detalle. "
+        "Empezá por los bloques en 🔴 y 🟡: son los que necesitan decisión."
+    )
+    summary_columns = st.columns(3)
+    for index, insight in enumerate(summary_insights):
+        with summary_columns[index % 3]:
+            st.markdown(_insight_card(insight), unsafe_allow_html=True)
+
+    # Renderizar insights (9 preguntas) como tarjetas con título amigable
+    st.markdown("### 📌 Detalle pregunta por pregunta")
     for insight in insights:
-        with st.container():
-            st.markdown(f"### {insight.question_number}. {insight.question}")
+        icon, label, color, _background = status_meta.get(
+            insight.status, status_meta["info"]
+        )
+        card_title = insight.title or insight.question
+        anchor = f"insight-{insight.question_number}"
+        st.markdown(f'<div id="{anchor}"></div>', unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown(
+                f"**{icon} {insight.question_number}. {card_title}** "
+                f"<span style='color:{color}; font-size:0.8rem; font-weight:600;'>· {label}</span>",
+                unsafe_allow_html=True,
+            )
             st.markdown(insight.answer)
-            st.divider()
 
     # Botón descargar reporte completo
     markdown_report = format_report_markdown(insights)

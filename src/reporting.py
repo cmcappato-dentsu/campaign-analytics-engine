@@ -30,6 +30,8 @@ class CampaignInsight:
     question_number: int
     question: str
     answer: str
+    title: str = ""
+    status: str = "info"  # "critical", "warning", "ok", "info"
     supporting_data: dict = field(default_factory=dict)
     chart_type: str | None = None
 
@@ -145,12 +147,50 @@ def generate_top_campaigns_summary(
     return "\n".join(lines)
 
 
+def _display_network_mask(network_series: pd.Series) -> pd.Series:
+    """Detecta filas servidas en la Red de Display (incluye 'content'/'contenido')."""
+
+    normalized = network_series.astype("string").str.lower()
+    return normalized.str.contains("display|content|contenido", na=False, regex=True)
+
+
+def _display_network_metrics_by_campaign(df_daily: pd.DataFrame | None) -> dict:
+    """Suma la inversión y los resultados generados en la Red de Display por campaña."""
+
+    if df_daily is None or "network" not in df_daily.columns:
+        return {}
+
+    display_rows = df_daily[_display_network_mask(df_daily["network"])]
+    if display_rows.empty:
+        return {}
+
+    spend_column = "spend_usd" if "spend_usd" in display_rows.columns else "spend"
+    aggregations = {"spend": (spend_column, "sum")}
+    if "conversions" in display_rows.columns:
+        aggregations["conversions"] = ("conversions", "sum")
+
+    grouped = display_rows.groupby("campaign", as_index=False).agg(**aggregations)
+    return {row["campaign"]: row for _, row in grouped.iterrows()}
+
+
+def _display_network_labels(df_daily: pd.DataFrame | None, campaign: str) -> list[str]:
+    """Devuelve las etiquetas de Red de Display observadas para una campaña."""
+
+    if df_daily is None or "network" not in df_daily.columns:
+        return []
+
+    mask = (df_daily["campaign"] == campaign) & _display_network_mask(df_daily["network"])
+    labels = df_daily.loc[mask, "network"].dropna().astype(str).unique()
+    return [label.strip() for label in labels if label.strip()]
+
+
 def generate_wasted_budget_insight(
     df_campaign: pd.DataFrame,
     eligibility_df: pd.DataFrame,
     display_findings: list,
     spend_no_results_findings: list,
     network_available: bool = True,
+    df_daily: pd.DataFrame | None = None,
 ) -> str:
     """Pregunta 3: ¿Hay presupuesto que se está desperdiciando (ej. Display en Búsqueda)?"""
 
@@ -163,11 +203,35 @@ def generate_wasted_budget_insight(
         lines.append("⚠️ **No se pudo evaluar la red (Network):** el reporte no incluye la columna de Red/Network, por lo que no es posible detectar gasto de Display en campañas de Búsqueda. Pedile al cliente/proveedor que exporte el reporte con la columna de Red incluida.")
         lines.append(f"")
 
-    # Display en búsqueda
+    # Display en búsqueda: el comentario de configuración va arriba del detalle
     if display_findings:
-        lines.append(f"🔴 **Red de Display activada en campañas de Búsqueda** (error de configuración):")
-        for f in display_findings:
-            lines.append(f"   - {f.message}")
+        lines.append(
+            "🔴 **Red de Display activada en campañas de Búsqueda** "
+            "(esto es un error de configuración que desperdicia presupuesto):"
+        )
+        display_metrics = _display_network_metrics_by_campaign(df_daily)
+        for finding in display_findings:
+            labels = _display_network_labels(df_daily, finding.campaign)
+            metrics = display_metrics.get(finding.campaign)
+            detail = f"   - **{finding.campaign}** está activa en la Red de Display"
+            if labels:
+                detail += f" (figura como: {', '.join(labels)})"
+            detail += "."
+            if metrics is not None:
+                detail += f" En esa red gastó {format_currency(metrics['spend'])}"
+                if "conversions" in metrics.index:
+                    conversions = metrics["conversions"]
+                    if pd.isna(conversions) or conversions == 0:
+                        detail += " y no generó ninguna conversión."
+                    else:
+                        detail += f" y generó {format_number(conversions)} conversiones."
+                else:
+                    detail += "."
+            lines.append(detail)
+        lines.append(
+            "   Conviene revisar la configuración de estas campañas y desactivar la "
+            "Red de Display, salvo que sea una decisión intencional."
+        )
         lines.append(f"")
 
     # Gasto sin resultados
@@ -423,6 +487,8 @@ def build_full_report(
     insights.append(CampaignInsight(
         question_number=1,
         question="¿Cuánto se invirtió y qué resultado se obtuvo en total?",
+        title="Performance de las campañas en el período",
+        status="info",
         answer=generate_executive_summary(df_campaign, df_daily, total_spend, total_conversions, total_clicks, total_impressions),
         supporting_data={
             "total_spend": total_spend,
@@ -437,6 +503,8 @@ def build_full_report(
     insights.append(CampaignInsight(
         question_number=2,
         question="¿Qué campañas concentran la mayor parte de la inversión y los resultados?",
+        title="Dónde está concentrada la plata y los resultados",
+        status="info",
         answer=generate_top_campaigns_summary(df_campaign),
         supporting_data={"pareto_analysis": pareto_analysis},
         chart_type="pareto_chart",
@@ -444,10 +512,29 @@ def build_full_report(
 
     # Pregunta 3
     network_available = "network" in df_daily.columns
+    low_volume_flagged = eligibility_df[
+        (eligibility_df["eligibility_status"] == "insufficient_volume") &
+        (eligibility_df["is_eligible"] == False)
+    ]
+    if display_findings or spend_no_results:
+        waste_status = "critical"
+    elif not low_volume_flagged.empty:
+        waste_status = "warning"
+    else:
+        waste_status = "ok"
     insights.append(CampaignInsight(
         question_number=3,
         question="¿Hay presupuesto que se está desperdiciando (ej. Display en Búsqueda)?",
-        answer=generate_wasted_budget_insight(df_campaign, eligibility_df, display_findings, spend_no_results, network_available=network_available),
+        title="Plata que puede estar desperdiciándose",
+        status=waste_status,
+        answer=generate_wasted_budget_insight(
+            df_campaign,
+            eligibility_df,
+            display_findings,
+            spend_no_results,
+            network_available=network_available,
+            df_daily=df_daily,
+        ),
         supporting_data={
             "display_findings": display_findings,
             "spend_no_results": spend_no_results,
@@ -456,45 +543,64 @@ def build_full_report(
     ))
 
     # Pregunta 4
+    scale_opportunities = [f for f in pareto_findings if f.get("rule_id") == "pareto_opportunity"]
+    budget_limited = [f for f in benchmark_findings if "budget" in f.rule_id.lower() or "impr_share" in f.rule_id.lower()]
     insights.append(CampaignInsight(
         question_number=4,
         question="¿Qué campañas tienen buen resultado y podrían recibir más presupuesto?",
+        title="Campañas a las que conviene darles más presupuesto",
+        status="ok" if (scale_opportunities or budget_limited) else "info",
         answer=generate_scale_opportunities(df_campaign, pareto_findings, benchmark_findings),
         supporting_data={"pareto_opportunities": pareto_findings},
         chart_type="scatter_cpa_conversions",
     ))
 
     # Pregunta 5
+    is_drop = [f for f in benchmark_findings if "impression_share" in f.rule_id.lower() or "impr_share" in f.rule_id.lower()]
     insights.append(CampaignInsight(
         question_number=5,
         question="¿Qué campañas están perdiendo visibilidad frente a la competencia?",
+        title="Pérdida de visibilidad frente a la competencia",
+        status="warning" if is_drop else "ok",
         answer=generate_visibility_loss_insight(benchmark_findings),
         supporting_data={"impression_share_findings": [f for f in benchmark_findings if "impr" in f.rule_id.lower()]},
         chart_type="impression_share_trend",
     ))
 
     # Pregunta 6
+    ctr_findings = [f for f in benchmark_findings if "ctr" in f.rule_id.lower()]
+    cvr_findings = [f for f in benchmark_findings if "conversion_rate" in f.rule_id.lower() or "conversions_drop" in f.rule_id.lower()]
     insights.append(CampaignInsight(
         question_number=6,
         question="¿Qué campañas atraen clics pero no logran conversiones (o al revés)?",
+        title="Clics que no se convierten (y viceversa)",
+        status="warning" if (ctr_findings or cvr_findings) else "ok",
         answer=generate_clicks_vs_conversions_insight(benchmark_findings),
-        supporting_data={"ctr_findings": [f for f in benchmark_findings if "ctr" in f.rule_id.lower()]},
+        supporting_data={"ctr_findings": ctr_findings},
         chart_type="ctr_vs_cvr_matrix",
     ))
 
     # Pregunta 7
+    cpa_findings = [f for f in benchmark_findings if "cpa" in f.rule_id.lower()]
     insights.append(CampaignInsight(
         question_number=7,
         question="¿Qué campañas tienen un costo por resultado demasiado alto?",
+        title="Campañas con costo por resultado elevado",
+        status="critical" if (cpa_findings or cpa_outliers) else "ok",
         answer=generate_high_cpa_insight(df_campaign, benchmark_findings, cpa_outliers),
         supporting_data={"cpa_findings": cpa_outliers},
         chart_type="cpa_ranking",
     ))
 
     # Pregunta 8
+    insufficient_count = len(
+        eligibility_df[eligibility_df["eligibility_status"].isin(["insufficient_volume", "insufficient_history"])]
+    )
     insights.append(CampaignInsight(
         question_number=8,
         question="¿Qué campañas tienen tan pocos datos que conviene esperar antes de sacar conclusiones?",
+        title="Campañas con pocos datos: esperar antes de decidir",
+        status="warning" if insufficient_count else "ok",
         answer=generate_insufficient_data_insight(eligibility_df),
         supporting_data={"eligibility_summary": eligibility_df["eligibility_status"].value_counts().to_dict()},
         chart_type=None,
@@ -504,6 +610,8 @@ def build_full_report(
     insights.append(CampaignInsight(
         question_number=9,
         question="¿Cuáles son los 2 a 5 hallazgos más relevantes de la semana?",
+        title="Los 2 a 5 hallazgos más importantes de la semana",
+        status="critical" if any(getattr(f, "is_outlier", False) for f in scored_findings) else "info",
         answer=generate_top_findings_summary(scored_findings),
         supporting_data={"scored_findings": scored_findings},
         chart_type=None,
@@ -525,7 +633,8 @@ def format_report_markdown(insights: list[CampaignInsight]) -> str:
     ]
 
     for insight in insights:
-        lines.append(f"## {insight.question_number}. {insight.question}")
+        heading = insight.title or insight.question
+        lines.append(f"## {insight.question_number}. {heading}")
         lines.append(f"")
         lines.append(insight.answer)
         lines.append(f"")
@@ -693,6 +802,8 @@ def build_enhanced_report(
             insights.insert(0, CampaignInsight(
                 question_number=0,
                 question="📋 Resumen Ejecutivo (IA)",
+                title="Resumen ejecutivo generado con IA",
+                status="info",
                 answer=llm_narrative,
                 supporting_data={"generated_by": "llm-groq"},
                 chart_type=None,
