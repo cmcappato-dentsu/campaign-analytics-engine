@@ -100,27 +100,44 @@ def generate_top_campaigns_summary(
 ) -> str:
     """Pregunta 2: ¿Qué campañas concentran la mayor parte de la inversión y los resultados?"""
 
-    top_spend = df_campaign.nlargest(top_n, "spend_usd")
-    top_conv = df_campaign.nlargest(top_n, "conversions")
+    total_campaigns = len(df_campaign)
+    effective_n = min(top_n, total_campaigns)
+    top_spend = df_campaign.nlargest(effective_n, "spend_usd")
+    top_conv = df_campaign.nlargest(effective_n, "conversions")
 
-    spend_pct = top_spend["spend_usd"].sum() / df_campaign["spend_usd"].sum() * 100
+    spend_pct = top_spend["spend_usd"].sum() / df_campaign["spend_usd"].sum() * 100 if df_campaign["spend_usd"].sum() > 0 else 0
     conv_pct = top_conv["conversions"].sum() / df_campaign["conversions"].sum() * 100 if df_campaign["conversions"].sum() > 0 else 0
 
-    lines = [
-        f"**Concentración de inversión y resultados (Top {top_n})**",
-        f"",
-        f"Las **{top_n} campañas con mayor inversión** concentran el **{spend_pct:.0f}%** del gasto total:",
-        f"",
-    ]
+    if total_campaigns <= top_n:
+        lines = [
+            f"**Distribución de inversión y resultados**",
+            f"",
+            f"La cuenta tiene **{total_campaigns} campañas** en total, así que el presupuesto se reparte entre todas ellas:",
+            f"",
+        ]
+    else:
+        lines = [
+            f"**Concentración de inversión y resultados (Top {effective_n})**",
+            f"",
+            f"Las **{effective_n} campañas con mayor inversión** concentran el **{spend_pct:.0f}%** del gasto total:",
+            f"",
+        ]
 
     for _, row in top_spend.iterrows():
         lines.append(f"- **{row['campaign']}**: {format_currency(row['spend_usd'])} ({row['spend_usd']/df_campaign['spend_usd'].sum()*100:.1f}% del total)")
 
-    lines.extend([
-        f"",
-        f"Las **{top_n} campañas con más conversiones** concentran el **{conv_pct:.0f}%** de los resultados:",
-        f"",
-    ])
+    if total_campaigns <= top_n:
+        lines.extend([
+            f"",
+            f"De la misma forma, las conversiones se reparten entre las **{total_campaigns} campañas**:",
+            f"",
+        ])
+    else:
+        lines.extend([
+            f"",
+            f"Las **{effective_n} campañas con más conversiones** concentran el **{conv_pct:.0f}%** de los resultados:",
+            f"",
+        ])
 
     for _, row in top_conv.iterrows():
         lines.append(f"- **{row['campaign']}**: {format_number(row['conversions'])} conv. ({row['conversions']/df_campaign['conversions'].sum()*100:.1f}% del total)")
@@ -133,6 +150,7 @@ def generate_wasted_budget_insight(
     eligibility_df: pd.DataFrame,
     display_findings: list,
     spend_no_results_findings: list,
+    network_available: bool = True,
 ) -> str:
     """Pregunta 3: ¿Hay presupuesto que se está desperdiciando (ej. Display en Búsqueda)?"""
 
@@ -140,6 +158,10 @@ def generate_wasted_budget_insight(
         f"**Detección de presupuesto desperdiciado**",
         f"",
     ]
+
+    if not network_available:
+        lines.append("⚠️ **No se pudo evaluar la red (Network):** el reporte no incluye la columna de Red/Network, por lo que no es posible detectar gasto de Display en campañas de Búsqueda. Pedile al cliente/proveedor que exporte el reporte con la columna de Red incluida.")
+        lines.append(f"")
 
     # Display en búsqueda
     if display_findings:
@@ -167,7 +189,7 @@ def generate_wasted_budget_insight(
         lines.append(f"🟡 **Campañas con volumen insuficiente para análisis pero con gasto**: {format_currency(total_wasted)} en {len(low_volume_spend)} campañas.")
         lines.append(f"   Estas campañas no generan señal estadística confiable. Revisar si mantener activas.")
 
-    if not display_findings and not spend_no_results_findings and low_volume_spend.empty:
+    if not display_findings and not spend_no_results_findings and low_volume_spend.empty and network_available:
         lines.append(f"✅ No se detectaron desperdicios evidentes de presupuesto en esta corrida.")
 
     return "\n".join(lines)
@@ -421,10 +443,11 @@ def build_full_report(
     ))
 
     # Pregunta 3
+    network_available = "network" in df_daily.columns
     insights.append(CampaignInsight(
         question_number=3,
         question="¿Hay presupuesto que se está desperdiciando (ej. Display en Búsqueda)?",
-        answer=generate_wasted_budget_insight(df_campaign, eligibility_df, display_findings, spend_no_results),
+        answer=generate_wasted_budget_insight(df_campaign, eligibility_df, display_findings, spend_no_results, network_available=network_available),
         supporting_data={
             "display_findings": display_findings,
             "spend_no_results": spend_no_results,
