@@ -182,13 +182,14 @@ Estructura obligatoria (máx 350 palabras), siguiendo el razonamiento del analis
 - Si hay desalineación gasto/resultados
 
 **3. PRESUPUESTO DESPERDICIADO (Pregunta 3)**
-- Red de Display en Búsqueda (config error)
-- Gasto sin clics/conversiones
+- Desperdicio confirmado: Red de Display en Búsqueda, gasto sin clics/conversiones, redes sin conversiones
+- Ineficiencia: campañas o redes con CPA muy superior a la mediana (exceso de costo, no plata perdida)
+- Oportunidad no capturada: campañas limitadas por presupuesto (no es desperdicio)
 - Campañas con volumen insuficiente pero gasto
 
 **4. OPORTUNIDADES DE ESCALA (Pregunta 4)**
-- Campañas eficientes con buen ROAS/CPA limitadas por presupuesto
-- Campañas con resultados pero poca inversión (Pareto conv ≠ Pareto inv)
+- Campañas limitadas por presupuesto (pierden impression share por presupuesto)
+- Techo adicional estimado y CPA vs mediana de la cuenta
 
 **5. VISIBILIDAD (Pregunta 5)**
 - Campañas perdiendo Impression Share vs benchmark histórico
@@ -259,15 +260,21 @@ def build_report_context(
     # Pregunta 3: Presupuesto desperdiciado
     disp = find_insights(["display", "red de display"])
     spend_nr = find_insights(["gasto sin", "sin clic", "sin convers"])
+    ineff = find_insights(["ineficiencia", "exceso de costo"])
+    opp = find_insights(["oportunidad no capturada"])
     p3_parts = []
     if disp:
         p3_parts.append(f"Display en Search: {len(disp)} campaña(s)")
     if spend_nr:
         p3_parts.append(f"Gasto sin resultados: {len(spend_nr)} campaña(s)")
+    if ineff:
+        p3_parts.append("Ineficiencia: exceso de costo detectado")
+    if opp:
+        p3_parts.append("Oportunidad no capturada por presupuesto (no es desperdicio)")
     p3 = f"3. DESPERDICIO: {'; '.join(p3_parts) if p3_parts else 'Sin desperdicios detectados'}"
 
     # Pregunta 4: Oportunidades de escala
-    scale = find_insights(["escal", "oportunidad", "pareto oportunidad"])
+    scale = find_insights(["escalar inversión", "limitadas por presupuesto"])
     p4 = f"4. ESCALA: {extract_msg(scale) if scale else 'Sin oportunidades claras'}"
 
     # Pregunta 5: Visibilidad

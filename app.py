@@ -26,7 +26,12 @@ from src.diagnostics import run_diagnostics, calculate_benchmark, build_persiste
 from src.outliers import run_outlier_detection
 from src.pareto import analyze_pareto_concentration
 from src.scoring import prioritize_findings
-from src.reporting import build_full_report, format_report_markdown, build_enhanced_report
+from src.reporting import (
+    INEFFICIENCY_TABLE_LIMIT,
+    build_full_report,
+    format_report_markdown,
+    build_enhanced_report,
+)
 
 
 st.set_page_config(
@@ -284,6 +289,37 @@ with tab_insights:
         </a>
         """
 
+    def _render_remaining_inefficiency(insight):
+        rows = insight.supporting_data.get("cpa_inefficient", [])
+        remaining = rows[INEFFICIENCY_TABLE_LIMIT:]
+        if not remaining:
+            return
+
+        state_key = f"ineff_rest::{uploaded_file.name}"
+        expanded = st.session_state.get(state_key, False)
+        label = (
+            "Ocultar campañas restantes"
+            if expanded
+            else f"Ver las {len(remaining)} campañas restantes"
+        )
+
+        if st.button(label, key=f"{state_key}::toggle"):
+            st.session_state[state_key] = not expanded
+            expanded = not expanded
+
+        if expanded:
+            st.dataframe(
+                pd.DataFrame({
+                    "Campaña": [row["campaign"] for row in remaining],
+                    "CPA": [format_currency(row["cpa"]) for row in remaining],
+                    "vs. mediana": [f"{row['ratio']:.1f}×" for row in remaining],
+                    "Conversiones": [format_integer(row["conversions"]) for row in remaining],
+                    "Exceso estimado": [format_currency(row["excess_cost"]) for row in remaining],
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
     st.markdown("## 🎯 Lectura rápida de la cuenta")
     st.caption(
         "Cada bloque responde una pregunta clave y te marca de un vistazo si hay que actuar."
@@ -379,6 +415,8 @@ with tab_insights:
                 unsafe_allow_html=True,
             )
             st.markdown(insight.answer)
+            if insight.question_number == 3:
+                _render_remaining_inefficiency(insight)
 
     # Botón descargar reporte completo
     markdown_report = format_report_markdown(insights)

@@ -5,6 +5,16 @@ import pandas as pd
 from typing import Optional
 from dataclasses import dataclass, field
 
+from config.thresholds import (
+    WASTE_CPA_MEDIAN_MULTIPLIER,
+    WASTE_LOST_IS_BUDGET_THRESHOLD,
+    WASTE_MIN_CAMPAIGNS_FOR_MEDIAN,
+    WASTE_NETWORK_CPA_MULTIPLIER,
+    WASTE_NETWORK_MIN_SPEND_SHARE,
+)
+
+INEFFICIENCY_TABLE_LIMIT = 10
+
 # LLM opcional
 try:
     from src.llm_client import generate_llm_narrative
@@ -184,6 +194,307 @@ def _display_network_labels(df_daily: pd.DataFrame | None, campaign: str) -> lis
     return [label.strip() for label in labels if label.strip()]
 
 
+def _spend_column(df: pd.DataFrame) -> str:
+    """Devuelve la columna de inversión disponible en el dataset."""
+
+    return "spend_usd" if "spend_usd" in df.columns else "spend"
+
+
+def _normalize_ratio(values: pd.Series) -> pd.Series:
+    """Lleva porcentajes exportados como 35 o 0,35 a una fracción entre 0 y 1."""
+
+    numeric = pd.to_numeric(values, errors="coerce")
+    return numeric.where(numeric <= 1, numeric / 100)
+
+
+def _eligible_campaign_names(eligibility_df: pd.DataFrame | None) -> set[str] | None:
+    """Devuelve el conjunto de campañas elegibles, o None si no hay datos."""
+
+    if eligibility_df is None or "is_eligible" not in eligibility_df.columns:
+        return None
+
+    eligible = eligibility_df["is_eligible"].eq(True) & eligibility_df["campaign"].notna()
+    return set(eligibility_df.loc[eligible, "campaign"].astype(str))
+
+
+def _median_eligible_cpa(
+    df_campaign: pd.DataFrame,
+    eligibility_df: pd.DataFrame | None,
+) -> float | None:
+    """Calcula el CPA mediano de las campañas elegibles con conversiones."""
+
+    if df_campaign is None or "cpa" not in df_campaign.columns:
+        return None
+
+    frame = df_campaign
+    eligible = _eligible_campaign_names(eligibility_df)
+    if eligible is not None:
+        frame = frame[frame["campaign"].astype(str).isin(eligible)]
+
+    valid = frame[(frame["conversions"] > 0) & frame["cpa"].notna()]
+    if len(valid) < WASTE_MIN_CAMPAIGNS_FOR_MEDIAN:
+        return None
+
+    return float(valid["cpa"].median())
+
+
+def _is_display_network(network: str) -> bool:
+    """Indica si una etiqueta de red corresponde a Display/Content."""
+
+    normalized = str(network).strip().lower()
+    return any(token in normalized for token in ("display", "content", "contenido"))
+
+
+def _network_performance_signals(
+    df_daily: pd.DataFrame | None,
+    total_spend: float,
+    display_findings: list,
+) -> tuple[list, list]:
+    """Detecta redes con gasto sin conversiones o con CPA muy superior."""
+
+    if df_daily is None or "network" not in df_daily.columns or total_spend <= 0:
+        return [], []
+
+    frame = df_daily[df_daily["network"].notna()].copy()
+    if frame.empty:
+        return [], []
+
+    spend_column = _spend_column(frame)
+    frame["_spend"] = pd.to_numeric(frame[spend_column], errors="coerce").fillna(0)
+    if "conversions" in frame.columns:
+        frame["_conversions"] = pd.to_numeric(frame["conversions"], errors="coerce").fillna(0)
+    else:
+        frame["_conversions"] = 0.0
+
+    grouped = frame.groupby(
+        ["campaign", "network"], dropna=False, as_index=False
+    ).agg(
+        spend=("_spend", "sum"),
+        conversions=("_conversions", "sum"),
+    )
+
+    campaign_totals = grouped.groupby("campaign").agg(
+        spend=("spend", "sum"),
+        conversions=("conversions", "sum"),
+    )
+    campaign_cpa = {
+        campaign: (row["spend"] / row["conversions"])
+        for campaign, row in campaign_totals.iterrows()
+        if row["conversions"] > 0 and row["spend"] > 0
+    }
+
+    display_campaigns = {finding.campaign for finding in display_findings}
+    zero_conversion = []
+    inefficient = []
+
+    for _, row in grouped.iterrows():
+        campaign = row["campaign"]
+        network = str(row["network"]).strip()
+        spend = float(row["spend"])
+        conversions = float(row["conversions"])
+
+        if not network or spend <= 0:
+            continue
+
+        share = spend / total_spend
+        if share < WASTE_NETWORK_MIN_SPEND_SHARE:
+            continue
+
+        # La Red de Display en Búsqueda ya se reporta como error de configuración.
+        if campaign in display_campaigns and _is_display_network(network):
+            continue
+
+        if conversions <= 0:
+            zero_conversion.append({
+                "campaign": campaign,
+                "network": network,
+                "spend": spend,
+                "share": share,
+            })
+            continue
+
+        reference_cpa = campaign_cpa.get(campaign)
+        if not reference_cpa:
+            continue
+
+        network_cpa = spend / conversions
+        if network_cpa > reference_cpa * WASTE_NETWORK_CPA_MULTIPLIER:
+            inefficient.append({
+                "campaign": campaign,
+                "network": network,
+                "spend": spend,
+                "conversions": conversions,
+                "cpa": network_cpa,
+                "campaign_cpa": reference_cpa,
+                "ratio": network_cpa / reference_cpa,
+            })
+
+    zero_conversion.sort(key=lambda row: row["spend"], reverse=True)
+    inefficient.sort(key=lambda row: row["spend"], reverse=True)
+    return zero_conversion, inefficient
+
+
+def _cpa_inefficiency_signals(
+    df_campaign: pd.DataFrame,
+    eligibility_df: pd.DataFrame | None,
+    median_cpa: float | None,
+) -> list[dict]:
+    """Campañas elegibles cuyo CPA supera ampliamente la mediana de la cuenta."""
+
+    if median_cpa is None or median_cpa <= 0 or df_campaign is None:
+        return []
+
+    frame = df_campaign
+    eligible = _eligible_campaign_names(eligibility_df)
+    if eligible is not None:
+        frame = frame[frame["campaign"].astype(str).isin(eligible)]
+
+    if "cpa" not in frame.columns:
+        return []
+
+    spend_column = _spend_column(frame)
+    valid = frame[
+        (frame["conversions"] > 0)
+        & (frame[spend_column] > 0)
+        & frame["cpa"].notna()
+    ]
+
+    threshold = median_cpa * WASTE_CPA_MEDIAN_MULTIPLIER
+    rows = []
+    for _, row in valid[valid["cpa"] > threshold].iterrows():
+        spend = float(row[spend_column])
+        conversions = float(row["conversions"])
+        cpa = float(row["cpa"])
+        rows.append({
+            "campaign": row["campaign"],
+            "spend": spend,
+            "conversions": conversions,
+            "cpa": cpa,
+            "median_cpa": median_cpa,
+            "ratio": cpa / median_cpa,
+            "excess_cost": max(0.0, spend - conversions * median_cpa),
+        })
+
+    rows.sort(key=lambda row: row["excess_cost"], reverse=True)
+    return rows
+
+
+def _budget_opportunity_signals(
+    df_daily: pd.DataFrame | None,
+    df_campaign: pd.DataFrame,
+    median_cpa: float | None,
+    eligibility_df: pd.DataFrame | None = None,
+) -> list[dict]:
+    """Campañas elegibles que pierden impresiones por presupuesto (oportunidad, no desperdicio)."""
+
+    if df_daily is None or "lost_is_budget" not in df_daily.columns:
+        return []
+
+    frame = df_daily.copy()
+    frame["_lost"] = _normalize_ratio(frame["lost_is_budget"])
+    frame = frame[frame["_lost"].notna()]
+    if frame.empty:
+        return []
+
+    if "impressions" in frame.columns:
+        frame["_weight"] = pd.to_numeric(frame["impressions"], errors="coerce").fillna(0)
+    else:
+        frame["_weight"] = 0.0
+
+    rows = []
+    for campaign, group in frame.groupby("campaign"):
+        weight = group["_weight"].sum()
+        if weight > 0:
+            lost = (group["_lost"] * group["_weight"]).sum() / weight
+        else:
+            lost = group["_lost"].mean()
+
+        if pd.notna(lost):
+            rows.append({"campaign": campaign, "lost_share": float(lost)})
+
+    if not rows:
+        return []
+
+    lost_df = pd.DataFrame(rows)
+
+    # Solo campañas elegibles: con volumen suficiente para sostener la conclusión.
+    eligible = _eligible_campaign_names(eligibility_df)
+    if eligible is not None:
+        lost_df = lost_df[lost_df["campaign"].astype(str).isin(eligible)]
+
+    spend_column = _spend_column(df_campaign)
+    metric_columns = ["campaign", spend_column, "conversions"]
+    if "cpa" in df_campaign.columns:
+        metric_columns.append("cpa")
+
+    merged = lost_df.merge(
+        df_campaign[metric_columns], on="campaign", how="inner"
+    )
+    merged = merged[
+        (merged["lost_share"] >= WASTE_LOST_IS_BUDGET_THRESHOLD)
+        & (merged[spend_column] > 0)
+    ]
+
+    opportunities = []
+    for _, row in merged.sort_values("lost_share", ascending=False).iterrows():
+        lost = min(float(row["lost_share"]), 0.90)
+        spend = float(row[spend_column])
+        cpa = row.get("cpa")
+        cpa = float(cpa) if pd.notna(cpa) else None
+
+        if median_cpa is None or cpa is None:
+            efficient = None
+        else:
+            efficient = cpa <= median_cpa
+
+        opportunities.append({
+            "campaign": row["campaign"],
+            "lost_share": lost,
+            "spend": spend,
+            "conversions": float(row["conversions"]),
+            "cpa": cpa,
+            "efficient": efficient,
+            "estimated_upside": spend * lost / (1 - lost) if lost > 0 else 0.0,
+        })
+
+    return opportunities
+
+
+def analyze_waste_signals(
+    df_campaign: pd.DataFrame,
+    eligibility_df: pd.DataFrame,
+    display_findings: list,
+    spend_no_results_findings: list,
+    network_available: bool = True,
+    df_daily: pd.DataFrame | None = None,
+) -> dict:
+    """Reúne las señales del punto 3 separando desperdicio, ineficiencia y oportunidad."""
+
+    total_spend = (
+        float(pd.to_numeric(df_daily[_spend_column(df_daily)], errors="coerce").fillna(0).sum())
+        if df_daily is not None and _spend_column(df_daily) in df_daily.columns
+        else float(df_campaign["spend_usd"].sum())
+    )
+    median_cpa = _median_eligible_cpa(df_campaign, eligibility_df)
+    network_zero, network_inefficient = _network_performance_signals(
+        df_daily, total_spend, display_findings
+    )
+
+    return {
+        "total_spend": total_spend,
+        "median_cpa": median_cpa,
+        "budget_data_available": df_daily is not None and "lost_is_budget" in df_daily.columns,
+        "network_zero_conversion": network_zero,
+        "network_inefficient": network_inefficient,
+        "cpa_inefficient": _cpa_inefficiency_signals(
+            df_campaign, eligibility_df, median_cpa
+        ),
+        "budget_opportunities": _budget_opportunity_signals(
+            df_daily, df_campaign, median_cpa, eligibility_df
+        ),
+    }
+
+
 def generate_wasted_budget_insight(
     df_campaign: pd.DataFrame,
     eligibility_df: pd.DataFrame,
@@ -191,45 +502,64 @@ def generate_wasted_budget_insight(
     spend_no_results_findings: list,
     network_available: bool = True,
     df_daily: pd.DataFrame | None = None,
+    analysis: dict | None = None,
 ) -> str:
     """Pregunta 3: ¿Hay presupuesto que se está desperdiciando (ej. Display en Búsqueda)?"""
 
+    analysis = analysis or analyze_waste_signals(
+        df_campaign,
+        eligibility_df,
+        display_findings,
+        spend_no_results_findings,
+        network_available=network_available,
+        df_daily=df_daily,
+    )
+
     lines = [
-        f"**Detección de presupuesto desperdiciado**",
+        "El análisis separa **desperdicio confirmado** (plata sin retorno), "
+        "**ineficiencia** (plata que rinde peor que la referencia) y "
+        "**oportunidad no capturada** (inversión que se podría sumar; no es plata perdida).",
         f"",
     ]
 
     if not network_available:
-        lines.append("⚠️ **No se pudo evaluar la red (Network):** el reporte no incluye la columna de Red/Network, por lo que no es posible detectar gasto de Display en campañas de Búsqueda. Pedile al cliente/proveedor que exporte el reporte con la columna de Red incluida.")
+        lines.append("⚠️ **No se pudo evaluar la red (Network):** el reporte no incluye la columna de Red/Network, por lo que no es posible detectar gasto de Display en campañas de Búsqueda ni comparar el rendimiento entre redes. Pedile al cliente/proveedor que exporte el reporte con la columna de Red incluida.")
         lines.append(f"")
 
-    # Display en búsqueda: el comentario de configuración va arriba del detalle
+    # Display en búsqueda: título del problema + tabla compacta por campaña
     if display_findings:
-        lines.append(
-            "🔴 **Red de Display activada en campañas de Búsqueda** "
-            "(esto es un error de configuración que desperdicia presupuesto):"
-        )
+        lines.append("🔴 **Red de Display activada en campañas de Búsqueda**")
+        lines.append("*Error de configuración que desperdicia presupuesto.*")
+        lines.append("")
+        lines.append("| Campaña | Red observada | Gasto en Display | Resultado |")
+        lines.append("| --- | --- | --- | --- |")
+
         display_metrics = _display_network_metrics_by_campaign(df_daily)
         for finding in display_findings:
             labels = _display_network_labels(df_daily, finding.campaign)
             metrics = display_metrics.get(finding.campaign)
-            detail = f"   - **{finding.campaign}** está activa en la Red de Display"
-            if labels:
-                detail += f" (figura como: {', '.join(labels)})"
-            detail += "."
-            if metrics is not None:
-                detail += f" En esa red gastó {format_currency(metrics['spend'])}"
-                if "conversions" in metrics.index:
-                    conversions = metrics["conversions"]
-                    if pd.isna(conversions) or conversions == 0:
-                        detail += " y no generó ninguna conversión."
-                    else:
-                        detail += f" y generó {format_number(conversions)} conversiones."
+
+            network_text = ", ".join(labels) if labels else "—"
+
+            if metrics is None:
+                spend_text = "—"
+                result_text = "—"
+            else:
+                spend_text = format_currency(metrics["spend"])
+                if "conversions" not in metrics.index or pd.isna(metrics["conversions"]):
+                    result_text = "—"
+                elif metrics["conversions"] == 0:
+                    result_text = "0 conversiones"
                 else:
-                    detail += "."
-            lines.append(detail)
+                    result_text = f"{format_number(metrics['conversions'])} conversiones"
+
+            lines.append(
+                f"| **{finding.campaign}** | {network_text} | {spend_text} | {result_text} |"
+            )
+
+        lines.append("")
         lines.append(
-            "   Conviene revisar la configuración de estas campañas y desactivar la "
+            "Conviene revisar la configuración de estas campañas y desactivar la "
             "Red de Display, salvo que sea una decisión intencional."
         )
         lines.append(f"")
@@ -241,6 +571,17 @@ def generate_wasted_budget_insight(
             lines.append(f"   - {f.message}")
         lines.append(f"")
 
+    # Redes con gasto y sin conversiones
+    if analysis["network_zero_conversion"]:
+        lines.append("🔴 **Redes con gasto y 0 conversiones**:")
+        for row in analysis["network_zero_conversion"]:
+            lines.append(
+                f"   - **{row['campaign']}** en la red \"{row['network']}\": "
+                f"{format_currency(row['spend'])} "
+                f"({format_percentage(row['share'])} del gasto total) sin conversiones."
+            )
+        lines.append(f"")
+
     # Campañas no elegibles por bajo volumen pero con gasto
     low_volume_spend = eligibility_df[
         (eligibility_df["eligibility_status"] == "insufficient_volume") &
@@ -250,50 +591,161 @@ def generate_wasted_budget_insight(
         total_wasted = low_volume_spend.merge(
             df_campaign[["campaign", "spend_usd"]], on="campaign"
         )["spend_usd"].sum()
-        lines.append(f"🟡 **Campañas con volumen insuficiente para análisis pero con gasto**: {format_currency(total_wasted)} en {len(low_volume_spend)} campañas.")
-        lines.append(f"   Estas campañas no generan señal estadística confiable. Revisar si mantener activas.")
+        lines.append(f"⚪ **Riesgo: campañas con volumen insuficiente para análisis pero con gasto**: {format_currency(total_wasted)} en {len(low_volume_spend)} campañas.")
+        lines.append("   Estas campañas no generan señal estadística confiable. Revisar si mantener activas.")
 
-    if not display_findings and not spend_no_results_findings and low_volume_spend.empty and network_available:
-        lines.append(f"✅ No se detectaron desperdicios evidentes de presupuesto en esta corrida.")
+    # Ineficiencia: campañas y redes con CPA muy superior a la referencia
+    cpa_inefficient = analysis["cpa_inefficient"]
+    network_inefficient = analysis["network_inefficient"]
+    if cpa_inefficient or network_inefficient:
+        header = "🟡 **Ineficiencia: exceso de costo estimado**"
+        if analysis["median_cpa"]:
+            header += f" (CPA mediano de la cuenta: {format_currency(analysis['median_cpa'])})"
+        lines.append(header)
+        lines.append("")
+
+        if cpa_inefficient:
+            lines.append("| Campaña | CPA | vs. mediana | Conversiones | Exceso estimado |")
+            lines.append("| --- | --- | --- | --- | --- |")
+            for row in cpa_inefficient[:INEFFICIENCY_TABLE_LIMIT]:
+                lines.append(
+                    f"| **{row['campaign']}** | {format_currency(row['cpa'])} | "
+                    f"{row['ratio']:.1f}× | {format_number(row['conversions'])} | "
+                    f"{format_currency(row['excess_cost'])} |"
+                )
+            lines.append("")
+
+            remaining = len(cpa_inefficient) - INEFFICIENCY_TABLE_LIMIT
+            if remaining > 0:
+                lines.append(
+                    f"Mostrando las {INEFFICIENCY_TABLE_LIMIT} campañas con mayor "
+                    f"exceso de costo de {len(cpa_inefficient)}. "
+                    f"Usá el botón **Ver las {remaining} restantes** para el detalle completo."
+                )
+                lines.append("")
+
+        if network_inefficient:
+            lines.append("**Ineficiencia por red**")
+            lines.append("")
+            lines.append("| Campaña | Red | CPA red | CPA campaña | Gasto |")
+            lines.append("| --- | --- | --- | --- | --- |")
+            for row in network_inefficient[:INEFFICIENCY_TABLE_LIMIT]:
+                lines.append(
+                    f"| **{row['campaign']}** | {row['network']} | "
+                    f"{format_currency(row['cpa'])} | {format_currency(row['campaign_cpa'])} | "
+                    f"{format_currency(row['spend'])} |"
+                )
+            lines.append("")
+
+    if (
+        network_available
+        and not display_findings
+        and not spend_no_results_findings
+        and not analysis["network_zero_conversion"]
+        and not cpa_inefficient
+        and not network_inefficient
+    ):
+        lines.append(f"✅ No se detectó desperdicio confirmado ni ineficiencia en esta corrida.")
+
+    # Oportunidad no capturada: el detalle completo vive en el punto 4
+    opportunities = analysis["budget_opportunities"]
+    if opportunities:
+        count = len(opportunities)
+        noun = "campaña" if count == 1 else "campañas"
+        adjective = "limitada" if count == 1 else "limitadas"
+        lines.append(f"")
+        lines.append(
+            f"🟠 **Oportunidad no capturada (no es desperdicio):** "
+            f"{count} {noun} {adjective} por presupuesto. "
+            f"El detalle y el techo estimado están en el **punto 4**."
+        )
+        lines.append(f"")
 
     return "\n".join(lines)
 
 
+
 def generate_scale_opportunities(
-    df_campaign: pd.DataFrame,
-    pareto_findings: list,
-    benchmark_findings: list,
+    opportunities: list[dict],
+    median_cpa: float | None,
+    budget_data_available: bool = True,
 ) -> str:
-    """Pregunta 4: ¿Qué campañas tienen buen resultado y podrían recibir más presupuesto?"""
+    """Pregunta 4: ¿Qué campañas podrían recibir más presupuesto?
+
+    Solo considera campañas limitadas por presupuesto (cuota de impresiones
+    perdida por presupuesto), no campañas eficientes por CPA sin esa señal.
+    """
 
     lines = [
         f"**Oportunidades de escalar inversión**",
         f"",
     ]
 
-    # Campañas en Pareto de conversiones pero no en Pareto de inversión
-    pareto_opp = [f for f in pareto_findings if f.get("rule_id") == "pareto_opportunity"]
-    if pareto_opp:
-        lines.append(f"🟢 **Campañas con buenos resultados pero inversión acotada** (Pareto conversiones ≠ Pareto inversión):")
-        for f in pareto_opp:
-            camps = f.get("campaigns", [])
-            for c in camps[:3]:
-                row = df_campaign[df_campaign["campaign"] == c]
-                if not row.empty:
-                    r = row.iloc[0]
-                    lines.append(f"   - **{c}**: {format_number(r['conversions'])} conv, CPA {format_currency(r.get('cpa', 0))}, inversión actual {format_currency(r['spend_usd'])}")
-        lines.append(f"")
+    if not budget_data_available:
+        lines.append(
+            "⚠️ **No se puede medir el techo de inversión:** el reporte no incluye "
+            "la columna de cuota de impresiones perdida por presupuesto "
+            "(`lost_is_budget`). Pedile al proveedor que la incluya para detectar "
+            "campañas limitadas por presupuesto."
+        )
+        return "\n".join(lines)
 
-    # Campañas con buen ROAS y limitadas por presupuesto (impression share perdido por presupuesto)
-    budget_limited = [f for f in benchmark_findings if "budget" in f.rule_id.lower() or "impr_share" in f.rule_id.lower()]
-    if budget_limited:
-        lines.append(f"🟢 **Campañas eficientes limitadas por presupuesto** (pierden impression share por presupuesto):")
-        for f in budget_limited:
-            lines.append(f"   - {f.message}")
-        lines.append(f"")
+    if not opportunities:
+        lines.append(
+            "✅ No se identificaron campañas limitadas por presupuesto "
+            f"(cuota perdida por presupuesto ≥ {format_percentage(WASTE_LOST_IS_BUDGET_THRESHOLD)})."
+        )
+        return "\n".join(lines)
 
-    if not pareto_opp and not budget_limited:
-        lines.append(f"⚠️ No se identificaron oportunidades claras de escala en esta corrida.")
+    total_spend = sum(row["spend"] for row in opportunities)
+    total_upside = sum(row["estimated_upside"] for row in opportunities)
+    count = len(opportunities)
+    noun = "campaña" if count == 1 else "campañas"
+    verb = "pierde" if count == 1 else "pierden"
+
+    lines.append(
+        f"Se detectaron **{count} {noun}** que {verb} impresiones "
+        f"por límite de presupuesto (cuota perdida ≥ "
+        f"{format_percentage(WASTE_LOST_IS_BUDGET_THRESHOLD)})."
+    )
+    if median_cpa is not None:
+        lines.append(
+            f"CPA mediano de la cuenta: **{format_currency(median_cpa)}**."
+        )
+    lines.append(
+        f"Inversión actual: **{format_currency(total_spend)}**. "
+        f"Techo adicional estimado: **{format_currency(total_upside)}**."
+    )
+    lines.append("")
+
+    lines.append(
+        "| Campaña | Cuota perdida por presupuesto | CPA | Inversión actual | Techo estimado | Prioridad |"
+    )
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+
+    for row in opportunities:
+        cpa_text = (
+            format_currency(row["cpa"]) if row["cpa"] is not None else "—"
+        )
+        if row["efficient"] is True:
+            priority = "🟢 Alta"
+        elif row["efficient"] is False:
+            priority = "🟡 Revisar eficiencia"
+        else:
+            priority = "⚪ Sin referencia"
+
+        lines.append(
+            f"| **{row['campaign']}** | {format_percentage(row['lost_share'])} | "
+            f"{cpa_text} | {format_currency(row['spend'])} | "
+            f"{format_currency(row['estimated_upside'])} | {priority} |"
+        )
+
+    lines.append("")
+    lines.append(
+        "El techo estimado es una referencia de cuánto más se podría invertir para "
+        "capturar las impresiones perdidas por presupuesto. No es una recomendación "
+        "automática: validar capacidad, objetivos y eficiencia antes de escalar."
+    )
 
     return "\n".join(lines)
 
@@ -477,10 +929,6 @@ def build_full_report(
     spend_no_results = [f for f in outlier_findings if "spend_no" in f.outlier_type.lower()]
     cpa_outliers = [f for f in outlier_findings if "cpa" in f.outlier_type.lower()]
 
-    # Pareto findings
-    from src.pareto import get_pareto_findings
-    pareto_findings = get_pareto_findings(pareto_analysis)
-
     insights = []
 
     # Pregunta 1
@@ -516,12 +964,30 @@ def build_full_report(
         (eligibility_df["eligibility_status"] == "insufficient_volume") &
         (eligibility_df["is_eligible"] == False)
     ]
-    if display_findings or spend_no_results:
+    waste_analysis = analyze_waste_signals(
+        df_campaign,
+        eligibility_df,
+        display_findings,
+        spend_no_results,
+        network_available=network_available,
+        df_daily=df_daily,
+    )
+    confirmed_waste = (
+        bool(display_findings)
+        or bool(spend_no_results)
+        or bool(waste_analysis["network_zero_conversion"])
+    )
+    inefficiency = (
+        bool(waste_analysis["cpa_inefficient"])
+        or bool(waste_analysis["network_inefficient"])
+    )
+    if confirmed_waste:
         waste_status = "critical"
-    elif not low_volume_flagged.empty:
+    elif inefficiency or not low_volume_flagged.empty:
         waste_status = "warning"
     else:
         waste_status = "ok"
+
     insights.append(CampaignInsight(
         question_number=3,
         question="¿Hay presupuesto que se está desperdiciando (ej. Display en Búsqueda)?",
@@ -534,24 +1000,33 @@ def build_full_report(
             spend_no_results,
             network_available=network_available,
             df_daily=df_daily,
+            analysis=waste_analysis,
         ),
         supporting_data={
             "display_findings": display_findings,
             "spend_no_results": spend_no_results,
+            "network_zero_conversion": waste_analysis["network_zero_conversion"],
+            "cpa_inefficient": waste_analysis["cpa_inefficient"],
+            "network_inefficient": waste_analysis["network_inefficient"],
+            "budget_opportunities": waste_analysis["budget_opportunities"],
+            "median_cpa": waste_analysis["median_cpa"],
         },
         chart_type="network_breakdown",
     ))
 
     # Pregunta 4
-    scale_opportunities = [f for f in pareto_findings if f.get("rule_id") == "pareto_opportunity"]
-    budget_limited = [f for f in benchmark_findings if "budget" in f.rule_id.lower() or "impr_share" in f.rule_id.lower()]
+    scale_opportunities = waste_analysis["budget_opportunities"]
     insights.append(CampaignInsight(
         question_number=4,
         question="¿Qué campañas tienen buen resultado y podrían recibir más presupuesto?",
         title="Campañas a las que conviene darles más presupuesto",
-        status="ok" if (scale_opportunities or budget_limited) else "info",
-        answer=generate_scale_opportunities(df_campaign, pareto_findings, benchmark_findings),
-        supporting_data={"pareto_opportunities": pareto_findings},
+        status="ok" if scale_opportunities else "info",
+        answer=generate_scale_opportunities(
+            scale_opportunities,
+            waste_analysis["median_cpa"],
+            budget_data_available=waste_analysis["budget_data_available"],
+        ),
+        supporting_data={"budget_opportunities": scale_opportunities},
         chart_type="scatter_cpa_conversions",
     ))
 
@@ -705,15 +1180,19 @@ def generate_template_executive_summary(
     # 3. DESPERDICIO
     disp = find_insights(["display", "red de display"])
     spend_nr = find_insights(["gasto sin", "sin clic", "sin convers"])
+    ineff = find_insights(["ineficiencia", "exceso de costo"])
+    opp = find_insights(["oportunidad no capturada"])
     waste_parts = []
     if disp: waste_parts.append(f"Display en Search: {len(disp)} campaña(s)")
     if spend_nr: waste_parts.append(f"Gasto sin resultados: {len(spend_nr)} campaña(s)")
+    if ineff: waste_parts.append("Ineficiencia detectada")
+    if opp: waste_parts.append("Oportunidad no capturada (no es desperdicio)")
     sections.append(
         f"**3. DESPERDICIO**: {'; '.join(waste_parts) if waste_parts else 'Sin desperdicios detectados'}"
     )
 
     # 4. ESCALA
-    scale = find_insights(["escal", "oportunidad", "pareto oportunidad"])
+    scale = find_insights(["escalar inversión", "limitadas por presupuesto"])
     sections.append(
         f"**4. ESCALA**: {extract_msg(scale) if scale else 'Sin oportunidades claras'}"
     )

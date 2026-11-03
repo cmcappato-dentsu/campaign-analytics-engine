@@ -61,6 +61,14 @@ def clean_dates(df):
     return df
 
 
+RATIO_COLUMNS = {
+    "impression_share",
+    "top_impression_share",
+    "lost_is_rank",
+    "lost_is_budget",
+}
+
+
 def clean_numeric_columns(df):
 
     df = df.copy()
@@ -73,6 +81,7 @@ def clean_numeric_columns(df):
         "conversion_value",
         "spend",
         "impression_share",
+        "top_impression_share",
         "lost_is_rank",
         "lost_is_budget",
     ]
@@ -88,12 +97,40 @@ def clean_numeric_columns(df):
         # Los reportes de performance pueden exportar cantidades con
         # separadores de miles (por ejemplo, "2,877" o "181,709.52").
         values = values.str.replace(",", "", regex=False)
+        has_percent_sign = values.str.contains("%", regex=False, na=False).any()
         values = values.str.replace("%", "", regex=False)
 
-        df[column] = pd.to_numeric(
+        numeric = pd.to_numeric(
             values,
             errors="coerce"
         )
+
+        # Las columnas de cuota se exportan como porcentaje (ej. "70.97%").
+        # Se normalizan a fracción 0-1 para que el resto del análisis sea
+        # consistente, incluso si el archivo no trae el signo "%".
+        if column in RATIO_COLUMNS and not numeric.dropna().empty:
+            if has_percent_sign or numeric.max() > 1:
+                numeric = numeric / 100
+
+        df[column] = numeric
+
+    return df
+
+
+def derive_impression_share(df):
+    """Estima la cuota de impresiones cuando el reporte no la incluye."""
+
+    df = df.copy()
+
+    if "impression_share" in df.columns:
+        return df
+
+    if "lost_is_budget" not in df.columns or "lost_is_rank" not in df.columns:
+        return df
+
+    df["impression_share"] = (
+        1 - df["lost_is_budget"] - df["lost_is_rank"]
+    ).clip(lower=0, upper=1)
 
     return df
 
@@ -109,6 +146,8 @@ def clean_report(df):
     df = clean_dates(df)
 
     df = clean_numeric_columns(df)
+
+    df = derive_impression_share(df)
 
     return df.reset_index(drop=True)
 
