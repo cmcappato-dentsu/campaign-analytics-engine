@@ -34,6 +34,47 @@ from src.reporting import (
 )
 
 
+TEMPLATE_HEADERS = [
+    "Día",
+    "Campaña",
+    "Clics",
+    "Impr.",
+    "Conversiones",
+    "Costo",
+    "Código de moneda",
+    "Estado de la campaña",
+    "Red",
+    "Estrategia de puja",
+    "Valor de conv.",
+]
+
+TEMPLATE_EXAMPLE = [
+    "2026-08-01",
+    "Campaña de ejemplo",
+    "100",
+    "1000",
+    "10",
+    "50.00",
+    "USD",
+    "Habilitada",
+    "Búsqueda de Google",
+    "Maximizar conversiones",
+    "500.00",
+]
+
+
+def build_template_csv() -> bytes:
+    """Genera una plantilla CSV compatible con el adaptador de Google Ads."""
+
+    lines = [
+        "Plantilla Miau - Google Ads",
+        "Rango de fechas",
+        ",".join(TEMPLATE_HEADERS),
+        ",".join(TEMPLATE_EXAMPLE),
+    ]
+    return "\n".join(lines).encode("utf-8-sig")
+
+
 st.set_page_config(
     page_title="Miau",
     layout="wide"
@@ -51,27 +92,27 @@ with st.sidebar:
     source = sources[source_id]
 
     uploaded_file = st.file_uploader(
-        "Cargá un reporte",
+        "Cargar un reporte",
         type=[extension.lstrip(".") for extension in source.extensions],
         help="El formato y las columnas se interpretan según la fuente seleccionada.",
     )
 
     if uploaded_file is None:
         st.divider()
-        st.caption("Los objetivos y opciones avanzadas se habilitan cuando cargues un archivo.")
+        st.caption("Los objetivos y opciones avanzadas se habilitan al cargar un archivo.")
     else:
         st.divider()
         st.subheader("🎯 Objetivos de performance")
         st.caption(
-            "✍️ Poné acá las metas que te pasó tu supervisor o las que definiste "
-            "con el cliente. La app las usa para avisarte cuando algo se sale del "
-            "plan. Los valores precargados son **un ejemplo básico**: editalos con tus "
-            "metas reales. Si una métrica no tiene objetivo, ponela en 0."
+            "✍️ Registrar aquí las metas definidas por el supervisor o acordadas "
+            "con el cliente. La app las usa para avisar cuando algo se sale del "
+            "plan. Los valores precargados son **un ejemplo básico**: conviene "
+            "editarlos con las metas reales. Si una métrica no tiene objetivo, dejar en 0."
         )
-        target_ctr = st.number_input("CTR objetivo (%)", min_value=0.0, value=2.0, step=0.1, format="%.2f", help="Porcentaje de clics sobre impresiones que querés lograr. Ejemplo: 2%.") / 100
-        target_cpc = st.number_input("CPC objetivo (USD)", min_value=0.0, value=0.50, step=0.01, format="%.2f", help="Cuánto querés pagar como máximo por cada clic. Ejemplo: USD 0,50.")
-        target_cpa = st.number_input("CPA objetivo (USD)", min_value=0.0, value=10.0, step=0.01, format="%.2f", help="Cuánto querés pagar como máximo por cada conversión. Ejemplo: USD 10.")
-        target_cvr = st.number_input("Tasa de conversión objetivo (%)", min_value=0.0, value=5.0, step=0.1, format="%.2f", help="Porcentaje de clics que querés que terminen en conversión. Ejemplo: 5%.") / 100
+        target_ctr = st.number_input("CTR objetivo (%)", min_value=0.0, value=2.0, step=0.1, format="%.2f", help="Porcentaje de clics sobre impresiones que se busca alcanzar. Ejemplo: 2%.") / 100
+        target_cpc = st.number_input("CPC objetivo (USD)", min_value=0.0, value=0.50, step=0.01, format="%.2f", help="Monto máximo que se busca pagar por cada clic. Ejemplo: USD 0,50.")
+        target_cpa = st.number_input("CPA objetivo (USD)", min_value=0.0, value=10.0, step=0.01, format="%.2f", help="Monto máximo que se busca pagar por cada conversión. Ejemplo: USD 10.")
+        target_cvr = st.number_input("Tasa de conversión objetivo (%)", min_value=0.0, value=5.0, step=0.1, format="%.2f", help="Porcentaje de clics que se busca que terminen en conversión. Ejemplo: 5%.") / 100
         targets = {
             "ctr": target_ctr or None,
             "cpc": target_cpc or None,
@@ -81,11 +122,11 @@ with st.sidebar:
 
         st.info(
             "ℹ️ **¿Para qué sirve esto?**\n\n"
-            "- Los objetivos que cargás son tu **norte**: la app compara lo real contra lo que te propusiste.\n"
-            "- Si el CPC o el CPA se pasan de tu objetivo, te va a saltar una alerta. Si el CTR o la tasa de conversión caen, también.\n"
-            "- En la pestaña **Insights** vas a ver una tablita que resume: cuánto venís, cuánto querés y cuánto te falta (o te sobra).\n\n"
-            "💡 **Tip:** si no tenés un objetivo para alguna métrica, dejala en 0 y la app la ignora. "
-            "Cambiá los números y todo se actualiza solo, no hace falta recargar."
+            "- Los objetivos cargados son el **norte**: la app compara lo real contra lo propuesto.\n"
+            "- Si el CPC o el CPA superan el objetivo, se genera una alerta. Si el CTR o la tasa de conversión caen, también.\n"
+            "- En la pestaña **Insights** hay una tabla que resume: cuánto se viene obteniendo, cuánto se busca y cuánto falta (o sobra).\n\n"
+            "💡 **Tip:** si una métrica no tiene objetivo, dejar en 0 y la app la ignora. "
+            "Los números se pueden cambiar y todo se actualiza solo, sin recargar."
         )
 
 suffix = None
@@ -101,10 +142,95 @@ if uploaded_file is None:
         "Motor de análisis automatizado de campañas que orienta y alinea al equipo de paid media."
     )
     st.info(
-        "👋 **¿Qué vas a encontrar acá?** Subí el reporte de tus campañas y la app te muestra de un vistazo: KPIs generales, performance por campaña, evolución diaria, gráficos de inversión y eficiencia, y alertas automáticas contra tus objetivos.\n\n"
-        "🧭 **¿Para qué sirve?** Miau es una **guía**: te orienta, prioriza los hallazgos y alinea a todo el equipo sobre dónde poner foco. No toma decisiones por vos — los cambios finales y la implementación en las plataformas los hacés vos con tu criterio y contexto de negocio."
+        "👋 **¿Qué ofrece Miau?** A partir del reporte de campañas, la app muestra de un vistazo: KPIs generales, performance por campaña, evolución diaria, gráficos de inversión y eficiencia, y alertas automáticas contra los objetivos definidos.\n\n"
+        "🧭 **¿Para qué sirve?** Miau es una **guía**: orienta, prioriza los hallazgos y alinea al equipo sobre dónde poner el foco. No reemplaza el criterio del analista: las decisiones finales y la implementación en las plataformas quedan en manos del equipo."
     )
-    st.info("Subí un archivo CSV o Excel para comenzar el análisis.")
+
+    st.divider()
+    st.subheader("📤 Cómo subir el archivo")
+    st.markdown(
+        "**1. Seleccionar la plataforma** en el panel lateral izquierdo. "
+        "Actualmente está disponible **Google Ads**."
+    )
+    st.markdown(
+        "**2. Cargar el archivo** desde el botón de carga. Formatos aceptados: "
+        "`.csv`, `.xlsx` y `.xls`."
+    )
+    st.markdown(
+        "**3. Usar la descarga del Editor de Informes de Google Ads**, no la de "
+        "la pestaña Campañas. El archivo presenta la siguiente estructura:"
+    )
+    st.markdown(
+        "| Fila | Contenido |\n"
+        "|---|---|\n"
+        "| 1 | Nombre del reporte |\n"
+        "| 2 | Rango de fechas |\n"
+        "| 3 | Encabezados de columnas |\n"
+        "| 4 en adelante | Una fila por día, campaña y red |"
+    )
+    st.markdown("**Columnas obligatorias** (se aceptan en español o inglés):")
+    st.markdown(
+        "`Día` · `Campaña` · `Clics` · `Impr.` · `Conversiones` · `Costo` · "
+        "`Código de moneda`"
+    )
+    st.warning(
+        '**Antes de cargar el archivo:** no eliminar ni renombrar columnas. '
+        'Los valores `"--"` se interpretan como “no disponible” (no como cero) '
+        "y las filas que comienzan con `Total:` se ignoran automáticamente."
+    )
+
+    st.divider()
+    st.subheader("📦 Qué datos contiene")
+    st.markdown(
+        "| Tipo | Campos |\n"
+        "|---|---|\n"
+        "| **Dimensiones** | Fecha, campaña, tipo de campaña, estado de la campaña, "
+        "red, estrategia de puja y moneda. |\n"
+        "| **Métricas** | Inversión (costo), impresiones, clics, conversiones y "
+        "valor de conversión. |\n"
+        "| **Opcionales** | Cuota de impresiones de búsqueda y % de impresiones "
+        "perdidas por ranking o presupuesto. |"
+    )
+    st.markdown(
+        "- **Alcance:** campañas de **Búsqueda**, a nivel campaña.\n"
+        "- **Análisis general:** aplica los mismos criterios a todas las campañas, "
+        "sin distinguir todavía entre performance y awareness.\n"
+        "- **Moneda:** se conserva la moneda de origen y se agrega el equivalente "
+        "en **USD** con la cotización del día."
+    )
+
+    st.divider()
+    st.subheader("🧭 Cómo cargarlo, paso a paso")
+    st.markdown(
+        "1. Seleccionar la plataforma en el panel lateral izquierdo.\n"
+        "2. Cargar el reporte.\n"
+        "3. La app valida las columnas, elimina las filas de totales y convierte "
+        "los importes a USD.\n"
+        "4. Opcional: definir los **objetivos** de CTR, CPC, CPA y tasa de "
+        "conversión en el panel lateral.\n"
+        "5. Revisar los **KPIs** y las pestañas **Insights**, **Gráficos**, "
+        "**Por campaña** y **Detalle diario**. El **resumen ejecutivo con IA** "
+        "es opcional."
+    )
+    st.info(
+        "💡 **Si algo no funciona**, la app indica el problema exacto antes de "
+        "procesar: columna faltante, moneda sin cotización o archivo sin filas válidas."
+    )
+
+    st.divider()
+    st.subheader("⬇️ Plantilla de ejemplo")
+    st.write(
+        "Descargar la **plantilla CSV** con las columnas correctas y las dos filas "
+        "de encabezado, completarla con los datos y volver a cargarla."
+    )
+    st.download_button(
+        "⬇️ Descargar plantilla CSV",
+        data=build_template_csv(),
+        file_name="plantilla_miau_google_ads.csv",
+        mime="text/csv",
+    )
+
+    st.info("Cargar un archivo CSV o Excel para comenzar el análisis.")
     st.stop()
 
 try:
