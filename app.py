@@ -1,6 +1,7 @@
 import streamlit as st
 import altair as alt
 import os
+import pandas as pd
 from tempfile import NamedTemporaryFile
 from dotenv import load_dotenv
 
@@ -28,17 +29,52 @@ from src.scoring import prioritize_findings
 from src.reporting import build_full_report, format_report_markdown, build_enhanced_report
 
 
+TEMPLATE_HEADERS = [
+    "Día",
+    "Campaña",
+    "Clics",
+    "Impr.",
+    "Conversiones",
+    "Costo",
+    "Código de moneda",
+    "Estado de la campaña",
+    "Red",
+    "Estrategia de puja",
+    "Valor de conv.",
+]
+
+TEMPLATE_EXAMPLE = [
+    "2026-08-01",
+    "Campaña de ejemplo",
+    "100",
+    "1000",
+    "10",
+    "50.00",
+    "USD",
+    "Habilitada",
+    "Búsqueda de Google",
+    "Maximizar conversiones",
+    "500.00",
+]
+
+
+def build_template_csv() -> bytes:
+    """Genera una plantilla CSV compatible con el adaptador de Google Ads."""
+
+    lines = [
+        "Plantilla Miau - Google Ads",
+        "Rango de fechas",
+        ",".join(TEMPLATE_HEADERS),
+        ",".join(TEMPLATE_EXAMPLE),
+    ]
+    return "\n".join(lines).encode("utf-8-sig")
+
+
 st.set_page_config(
     page_title="Miau",
     layout="wide"
 )
 
-
-st.title("Miau")
-
-st.write(
-    "Motor de análisis automatizado de campañas."
-)
 
 # --- SELECCIÓN DE PLATAFORMA Y UPLOAD EN SIDEBAR (colapsible nativo ☰) ---
 with st.sidebar:
@@ -51,16 +87,146 @@ with st.sidebar:
     source = sources[source_id]
 
     uploaded_file = st.file_uploader(
-        "Cargá un reporte",
+        "Cargar un reporte",
         type=[extension.lstrip(".") for extension in source.extensions],
         help="El formato y las columnas se interpretan según la fuente seleccionada.",
     )
 
     if uploaded_file is None:
-        st.info("Subí un archivo CSV o Excel para comenzar el análisis.")
-        st.stop()
+        st.divider()
+        st.caption("Los objetivos y opciones avanzadas se habilitan al cargar un archivo.")
+    else:
+        st.divider()
+        st.subheader("🎯 Objetivos de performance")
+        st.caption(
+            "✍️ Registrar aquí las metas definidas por el supervisor o acordadas "
+            "con el cliente. La app las usa para avisar cuando algo se sale del "
+            "plan. Los valores precargados son **un ejemplo básico**: conviene "
+            "editarlos con las metas reales. Si una métrica no tiene objetivo, dejar en 0."
+        )
+        target_ctr = st.number_input("CTR objetivo (%)", min_value=0.0, value=2.0, step=0.1, format="%.2f", help="Porcentaje de clics sobre impresiones que se busca alcanzar. Ejemplo: 2%.") / 100
+        target_cpc = st.number_input("CPC objetivo (USD)", min_value=0.0, value=0.50, step=0.01, format="%.2f", help="Monto máximo que se busca pagar por cada clic. Ejemplo: USD 0,50.")
+        target_cpa = st.number_input("CPA objetivo (USD)", min_value=0.0, value=10.0, step=0.01, format="%.2f", help="Monto máximo que se busca pagar por cada conversión. Ejemplo: USD 10.")
+        target_cvr = st.number_input("Tasa de conversión objetivo (%)", min_value=0.0, value=5.0, step=0.1, format="%.2f", help="Porcentaje de clics que se busca que terminen en conversión. Ejemplo: 5%.") / 100
+        targets = {
+            "ctr": target_ctr or None,
+            "cpc": target_cpc or None,
+            "cpa": target_cpa or None,
+            "conversion_rate": target_cvr or None,
+        }
 
-suffix = "." + uploaded_file.name.rsplit(".", 1)[-1].lower()
+        st.info(
+            "ℹ️ **¿Para qué sirve esto?**\n\n"
+            "- Los objetivos cargados son el **norte**: la app compara lo real contra lo propuesto.\n"
+            "- Si el CPC o el CPA superan el objetivo, se genera una alerta. Si el CTR o la tasa de conversión caen, también.\n"
+            "- En la pestaña **Insights** hay una tabla que resume: cuánto se viene obteniendo, cuánto se busca y cuánto falta (o sobra).\n\n"
+            "💡 **Tip:** si una métrica no tiene objetivo, dejar en 0 y la app la ignora. "
+            "Los números se pueden cambiar y todo se actualiza solo, sin recargar."
+        )
+
+suffix = None
+if uploaded_file is not None:
+    suffix = "." + uploaded_file.name.rsplit(".", 1)[-1].lower()
+
+st.title("Miau")
+
+st.caption("**M**arketing **I**ntelligence & **A**utomated **U**nderstanding")
+
+if uploaded_file is None:
+    st.write(
+        "Motor de análisis automatizado de campañas que orienta y alinea al equipo de paid media."
+    )
+    st.info(
+        "👋 **¿Qué ofrece Miau?** A partir del reporte de campañas, la app muestra de un vistazo: KPIs generales, performance por campaña, evolución diaria, gráficos de inversión y eficiencia, y alertas automáticas contra los objetivos definidos.\n\n"
+        "🧭 **¿Para qué sirve?** Miau es una **guía**: orienta, prioriza los hallazgos y alinea al equipo sobre dónde poner el foco. No reemplaza el criterio del analista: las decisiones finales y la implementación en las plataformas quedan en manos del equipo."
+    )
+
+    st.divider()
+    st.subheader("📤 Cómo subir el archivo")
+    st.markdown(
+        "**1. Seleccionar la plataforma** en el panel lateral izquierdo. "
+        "Actualmente está disponible **Google Ads**."
+    )
+    st.markdown(
+        "**2. Cargar el archivo** desde el botón de carga. Formatos aceptados: "
+        "`.csv`, `.xlsx` y `.xls`."
+    )
+    st.markdown(
+        "**3. Usar la descarga del Editor de Informes de Google Ads**, no la de "
+        "la pestaña Campañas. El archivo presenta la siguiente estructura:"
+    )
+    st.markdown(
+        "| Fila | Contenido |\n"
+        "|---|---|\n"
+        "| 1 | Nombre del reporte |\n"
+        "| 2 | Rango de fechas |\n"
+        "| 3 | Encabezados de columnas |\n"
+        "| 4 en adelante | Una fila por día, campaña y red |"
+    )
+    st.markdown("**Columnas obligatorias** (se aceptan en español o inglés):")
+    st.markdown(
+        "`Día` · `Campaña` · `Clics` · `Impr.` · `Conversiones` · `Costo` · "
+        "`Código de moneda`"
+    )
+    st.warning(
+        '**Antes de cargar el archivo:** no eliminar ni renombrar columnas. '
+        'Los valores `"--"` se interpretan como “no disponible” (no como cero) '
+        "y las filas que comienzan con `Total:` se ignoran automáticamente."
+    )
+
+    st.divider()
+    st.subheader("📦 Qué datos contiene")
+    st.markdown(
+        "| Tipo | Campos |\n"
+        "|---|---|\n"
+        "| **Dimensiones** | Fecha, campaña, tipo de campaña, estado de la campaña, "
+        "red, estrategia de puja y moneda. |\n"
+        "| **Métricas** | Inversión (costo), impresiones, clics, conversiones y "
+        "valor de conversión. |\n"
+        "| **Opcionales** | Cuota de impresiones de búsqueda y % de impresiones "
+        "perdidas por ranking o presupuesto. |"
+    )
+    st.markdown(
+        "- **Alcance:** campañas de **Búsqueda**, a nivel campaña.\n"
+        "- **Análisis general:** aplica los mismos criterios a todas las campañas, "
+        "sin distinguir todavía entre performance y awareness.\n"
+        "- **Moneda:** se conserva la moneda de origen y se agrega el equivalente "
+        "en **USD** con la cotización del día."
+    )
+
+    st.divider()
+    st.subheader("🧭 Cómo cargarlo, paso a paso")
+    st.markdown(
+        "1. Seleccionar la plataforma en el panel lateral izquierdo.\n"
+        "2. Cargar el reporte.\n"
+        "3. La app valida las columnas, elimina las filas de totales y convierte "
+        "los importes a USD.\n"
+        "4. Opcional: definir los **objetivos** de CTR, CPC, CPA y tasa de "
+        "conversión en el panel lateral.\n"
+        "5. Revisar los **KPIs** y las pestañas **Insights**, **Gráficos**, "
+        "**Por campaña** y **Detalle diario**. El **resumen ejecutivo con IA** "
+        "es opcional."
+    )
+    st.info(
+        "💡 **Si algo no funciona**, la app indica el problema exacto antes de "
+        "procesar: columna faltante, moneda sin cotización o archivo sin filas válidas."
+    )
+
+    st.divider()
+    st.subheader("⬇️ Plantilla de ejemplo")
+    st.write(
+        "Descargar la **plantilla CSV** con las columnas correctas y las dos filas "
+        "de encabezado, completarla con los datos y volver a cargarla."
+    )
+    st.download_button(
+        "⬇️ Descargar plantilla CSV",
+        data=build_template_csv(),
+        file_name="plantilla_miau_google_ads.csv",
+        mime="text/csv",
+    )
+
+    st.info("Cargar un archivo CSV o Excel para comenzar el análisis.")
+    st.stop()
 
 try:
     with NamedTemporaryFile(suffix=suffix, delete=False) as temporary_file:
@@ -112,9 +278,19 @@ campaign = result["campaign"]
 eligibility_df = evaluate_eligibility(campaign, daily)
 eligible_campaigns = get_eligible_campaigns(campaign, daily)["campaign"].tolist()
 
-# 2. Benchmark histórico (requiere histórico - por ahora usamos datos actuales como proxy)
-# TODO: En producción, cargar histórico de data/processed/history/
-df_benchmark = calculate_benchmark(daily) if len(daily) > 1 else None
+# 2. Benchmark: los objetivos editados reemplazan al benchmark histórico.
+df_benchmark = None
+active_targets = {metric: value for metric, value in targets.items() if value is not None}
+if active_targets:
+    df_benchmark = pd.DataFrame(
+        [
+            {"campaign": camp, "metric": metric, "benchmark_value": value}
+            for camp in campaign["campaign"].unique()
+            for metric, value in active_targets.items()
+        ]
+    )
+elif len(daily) > 1:
+    df_benchmark = calculate_benchmark(daily)
 persistence_df = build_persistence_tracker(daily, df_benchmark) if df_benchmark is not None else None
 
 # 3. Diagnósticos
@@ -163,14 +339,32 @@ st.caption(
     "las cotizaciones se consultan en cada análisis."
 )
 
-top_row = st.columns(3)
-top_row[0].metric("Inversión en USD", format_currency(total_spend))
-top_row[1].metric("Impresiones", format_integer(total_impressions))
-top_row[2].metric("Clics", format_integer(total_clicks))
+def _kpi_card(label: str, value: str, emoji: str = "") -> str:
+    return f"""
+    <div style="
+        background-color: #ffffff;
+        border: 1px solid #f1f3f5;
+        border-left: 3px solid #a5d8ff;
+        border-radius: 8px;
+        padding: 12px 14px;
+        margin-bottom: 8px;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    ">
+        <div style="font-size: 0.8rem; color: #adb5bd; text-transform: uppercase; letter-spacing: 0.5px;">{emoji} {label}</div>
+        <div style="font-size: 1.6rem; font-weight: 600; color: #495057;">{value}</div>
+    </div>
+    """
 
-bottom_row = st.columns(2)
-bottom_row[0].metric("CTR", format_percentage(ctr))
-bottom_row[1].metric("CPA en USD", format_currency(cpa))
+kpi_columns = st.columns(5)
+kpi_data = [
+    ("Inversión", format_currency(total_spend), "💰"),
+    ("Impresiones", format_integer(total_impressions), "👁️"),
+    ("Clics", format_integer(total_clicks), "👆"),
+    ("CTR", format_percentage(ctr), "📈"),
+    ("CPA", format_currency(cpa), "🎯"),
+]
+for column, (label, value, emoji) in zip(kpi_columns, kpi_data):
+    column.markdown(_kpi_card(label, value, emoji), unsafe_allow_html=True)
 
 # --- TABS ---
 tab_insights, tab_charts, tab_campaigns, tab_daily = st.tabs(
@@ -178,9 +372,50 @@ tab_insights, tab_charts, tab_campaigns, tab_daily = st.tabs(
 )
 
 with tab_insights:
-    st.subheader("Análisis automático - 9 preguntas clave")
-    
-    # Resumen de elegibilidad
+    status_meta = {
+        "critical": ("🔴", "Acción urgente", "#e03131", "#fff5f5"),
+        "warning": ("🟡", "Para revisar", "#f08c00", "#fff9db"),
+        "ok": ("🟢", "En orden", "#2f9e44", "#ebfbee"),
+        "info": ("🔵", "Informativo", "#1c7ed6", "#e7f5ff"),
+    }
+
+    def _insight_card(insight):
+        icon, label, color, background = status_meta.get(
+            insight.status, status_meta["info"]
+        )
+        card_title = insight.title or insight.question
+        anchor = f"insight-{insight.question_number}"
+        return f"""
+        <a href="#{anchor}" style="text-decoration: none; color: inherit;">
+        <div style="
+            border-left: 5px solid {color};
+            background-color: {background};
+            border-radius: 8px;
+            padding: 7px 10px;
+            margin-bottom: 6px;
+            min-height: 68px;
+            cursor: pointer;
+            transition: box-shadow 0.15s ease;
+        ">
+            <div style="font-size: 0.62rem; color: #868e96; text-transform: uppercase; letter-spacing: 0.5px;">
+                Pregunta {insight.question_number}
+            </div>
+            <div style="font-weight: 600; color: #343a40; font-size: 0.82rem; line-height: 1.2; margin: 1px 0 4px;">
+                {card_title}
+            </div>
+            <div style="font-size: 0.72rem; color: {color}; font-weight: 600;">
+                {icon} {label}
+            </div>
+        </div>
+        </a>
+        """
+
+    st.markdown("## 🎯 Lectura rápida de la cuenta")
+    st.caption(
+        "Cada bloque responde una pregunta clave y te marca de un vistazo si hay que actuar."
+    )
+
+    # Resumen de elegibilidad (primero, contexto de qué campañas entran al análisis)
     elig_summary = get_eligibility_summary(eligibility_df)
     with st.expander("📋 Elegibilidad de campañas para análisis", expanded=False):
         col1, col2, col3, col4 = st.columns(4)
@@ -188,19 +423,88 @@ with tab_insights:
         col2.metric("✅ Elegibles", elig_summary["eligible"])
         col3.metric("🟡 Volumen insuficiente", elig_summary["insufficient_volume"])
         col4.metric("🔴 Gasto sin resultados", elig_summary["spend_no_results"])
-        
+
         st.dataframe(
             eligibility_df[["campaign", "eligibility_status", "eligibility_reason", "is_eligible"]],
             use_container_width=True,
             hide_index=True,
         )
 
-    # Renderizar insights (9 preguntas)
+    # Tabla Objetivos vs performance actual
+    if active_targets:
+        total_spend = daily["spend_usd"].sum()
+        total_clicks = daily["clicks"].sum()
+        total_impressions = daily["impressions"].sum()
+        total_conversions = daily["conversions"].sum()
+        actuals = {
+            "ctr": total_clicks / total_impressions if total_impressions else None,
+            "cpc": total_spend / total_clicks if total_clicks else None,
+            "cpa": total_spend / total_conversions if total_conversions else None,
+            "conversion_rate": total_conversions / total_clicks if total_clicks else None,
+        }
+        labels = {
+            "ctr": "CTR",
+            "cpc": "CPC (USD)",
+            "cpa": "CPA (USD)",
+            "conversion_rate": "Tasa de conversión",
+        }
+        lower_is_better = {"cpc", "cpa"}
+        rows = []
+        for metric, target in active_targets.items():
+            actual = actuals.get(metric)
+            deviation = (actual - target) / target if actual is not None and target else None
+            is_rate = metric in ("ctr", "conversion_rate")
+            if deviation is None:
+                estado = "—"
+            elif abs(deviation) <= 0.10:
+                estado = "🟢 En objetivo"
+            elif (metric in lower_is_better and deviation < 0) or (metric not in lower_is_better and deviation > 0):
+                estado = "🟢 Mejor que objetivo"
+            else:
+                estado = "🔴 Fuera de objetivo"
+            rows.append({
+                "Métrica": labels[metric],
+                "Real": f"{actual:.2%}" if is_rate and actual is not None else (f"{actual:,.2f}" if actual is not None else "—"),
+                "Objetivo": f"{target:.2%}" if is_rate else f"{target:,.2f}",
+                "Desvío vs objetivo": f"{deviation:+.1%}" if deviation is not None else "—",
+                "Estado": estado,
+            })
+        comparison = pd.DataFrame(rows)
+        st.markdown("### 🎯 Objetivos vs performance")
+        st.caption(
+            "Compara lo real contra tus metas. 🟢 = en objetivo o mejor; "
+            "🔴 = te alejaste y conviene revisarlo."
+        )
+        st.dataframe(comparison, use_container_width=True, hide_index=True)
+
+    summary_insights = [i for i in insights if i.question_number > 0]
+
+    st.markdown("### 🔎 Resumen de un vistazo")
+    st.caption(
+        "Semáforo de las 9 preguntas. Hacé clic en cualquier tarjeta para ir al detalle. "
+        "Empezá por los bloques en 🔴 y 🟡: son los que necesitan decisión."
+    )
+    summary_columns = st.columns(3)
+    for index, insight in enumerate(summary_insights):
+        with summary_columns[index % 3]:
+            st.markdown(_insight_card(insight), unsafe_allow_html=True)
+
+    # Renderizar insights (9 preguntas) como tarjetas con título amigable
+    st.markdown("### 📌 Detalle pregunta por pregunta")
     for insight in insights:
-        with st.container():
-            st.markdown(f"### {insight.question_number}. {insight.question}")
+        icon, label, color, _background = status_meta.get(
+            insight.status, status_meta["info"]
+        )
+        card_title = insight.title or insight.question
+        anchor = f"insight-{insight.question_number}"
+        st.markdown(f'<div id="{anchor}"></div>', unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown(
+                f"**{icon} {insight.question_number}. {card_title}** "
+                f"<span style='color:{color}; font-size:0.8rem; font-weight:600;'>· {label}</span>",
+                unsafe_allow_html=True,
+            )
             st.markdown(insight.answer)
-            st.divider()
 
     # Botón descargar reporte completo
     markdown_report = format_report_markdown(insights)

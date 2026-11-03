@@ -100,6 +100,15 @@ def load_report(
         )
 
     df = rename_columns_to_canonical(df)
+
+    # Fallback: si la columna de red no mapeó por nombre exacto, buscar por aproximación
+    if "network" not in df.columns:
+        for column in df.columns:
+            normalized = normalize_column_name(column)
+            if "network" in normalized or normalized == "red" or normalized.startswith("red "):
+                df = df.rename(columns={column: "network"})
+                break
+
     missing_columns = [
         column for column in REQUIRED_COLUMNS if column not in df.columns
     ]
