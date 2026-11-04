@@ -168,28 +168,30 @@ if uploaded_file is None:
         "| 3 | Encabezados de columnas |\n"
         "| 4 en adelante | Una fila por día, campaña y red |"
     )
-    st.markdown("**Columnas obligatorias** (se aceptan en español o inglés):")
-    st.markdown(
-        "`Día` · `Campaña` · `Clics` · `Impr.` · `Conversiones` · `Costo` · "
-        "`Código de moneda`"
-    )
-    st.warning(
-        '**Antes de cargar el archivo:** no eliminar ni renombrar columnas. '
-        'Los valores `"--"` se interpretan como “no disponible” (no como cero) '
-        "y las filas que comienzan con `Total:` se ignoran automáticamente."
-    )
 
     st.divider()
-    st.subheader("📦 Qué datos contiene")
+    st.subheader("📦 Qué datos contiene el reporte")
     st.markdown(
-        "| Tipo | Campos |\n"
-        "|---|---|\n"
-        "| **Dimensiones** | Fecha, campaña, tipo de campaña, estado de la campaña, "
-        "red, estrategia de puja y moneda. |\n"
-        "| **Métricas** | Inversión (costo), impresiones, clics, conversiones y "
-        "valor de conversión. |\n"
-        "| **Opcionales** | Cuota de impresiones de búsqueda y % de impresiones "
-        "perdidas por ranking o presupuesto. |"
+        "El reporte se compone de columnas obligatorias y opcionales. "
+        "Los encabezados se aceptan en español o inglés."
+    )
+    st.markdown(
+        "| Columna | ¿Obligatoria? | Contenido |\n"
+        "|---|---|---|\n"
+        "| `Día` | Sí | Fecha de cada registro. |\n"
+        "| `Campaña` | Sí | Nombre de la campaña. |\n"
+        "| `Clics` | Sí | Clics del día. |\n"
+        "| `Impr.` | Sí | Impresiones del día. |\n"
+        "| `Conversiones` | Sí | Conversiones atribuidas. |\n"
+        "| `Costo` | Sí | Inversión del día en la moneda de origen. |\n"
+        "| `Código de moneda` | Sí | Moneda del reporte (por ejemplo, `ARS` o `USD`). |\n"
+        "| `Valor de conv.` | No | Valor total de las conversiones; habilita el ROAS. |\n"
+        "| `Estado de la campaña` | No | Estado de la campaña (habilitada, pausada, etc.). |\n"
+        "| `Red` | No | Red de entrega (Búsqueda, Display, etc.). |\n"
+        "| `Estrategia de puja` | No | Estrategia de oferta configurada. |\n"
+        "| `Cuota de impresiones de búsqueda` | No | Porcentaje de impresiones obtenidas. |\n"
+        "| `% de impresiones perdidas por ranking` | No | Impresiones perdidas por ranking. |\n"
+        "| `% de impresiones perdidas por presupuesto` | No | Impresiones perdidas por presupuesto. |"
     )
     st.markdown(
         "- **Alcance:** campañas de **Búsqueda**, a nivel campaña.\n"
@@ -197,6 +199,11 @@ if uploaded_file is None:
         "sin distinguir todavía entre performance y awareness.\n"
         "- **Moneda:** se conserva la moneda de origen y se agrega el equivalente "
         "en **USD** con la cotización del día."
+    )
+    st.warning(
+        '**Antes de cargar el archivo:** no eliminar ni renombrar columnas. '
+        'Los valores `"--"` se interpretan como “no disponible” (no como cero) '
+        "y las filas que comienzan con `Total:` se ignoran automáticamente."
     )
 
     st.divider()
