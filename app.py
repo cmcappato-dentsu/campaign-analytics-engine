@@ -329,6 +329,8 @@ insights, llm_narrative = build_enhanced_report(
     pareto_analysis, scored_findings, result["currency"],
     use_llm=use_llm,
     api_key=api_key,
+    benchmark_source="targets" if active_targets else "history",
+    benchmark_targets=active_targets,
 )
 
 # --- KPIs GENERALES ---
@@ -524,7 +526,7 @@ with tab_insights:
 
     st.markdown("### 🔎 Resumen de un vistazo")
     st.caption(
-        "Semáforo de las 9 preguntas. Hacé clic en cualquier tarjeta para ir al detalle. "
+        "Semáforo de las 7 preguntas. Hacé clic en cualquier tarjeta para ir al detalle. "
         "Empezá por los bloques en 🔴 y 🟡: son los que necesitan decisión."
     )
     summary_columns = st.columns(3)
@@ -532,7 +534,7 @@ with tab_insights:
         with summary_columns[index % 3]:
             st.markdown(_insight_card(insight), unsafe_allow_html=True)
 
-    # Renderizar insights (9 preguntas) como tarjetas con título amigable
+    # Renderizar insights (7 preguntas) como tarjetas con título amigable
     st.markdown("### 📌 Detalle pregunta por pregunta")
     for insight in insights:
         icon, label, color, _background = status_meta.get(
@@ -551,10 +553,10 @@ with tab_insights:
             if insight.question_number == 3:
                 _render_remaining_inefficiency(insight)
 
-    # Botón descargar reporte completo
+    # Botón descargar reporte completo (Markdown)
     markdown_report = format_report_markdown(insights)
     st.download_button(
-        "📥 Descargar reporte completo (Markdown)",
+        "📄 Descargar reporte completo (Markdown)",
         markdown_report.encode("utf-8"),
         file_name="reporte_miau.md",
         mime="text/markdown",

@@ -184,34 +184,31 @@ Estructura obligatoria (máx 350 palabras), siguiendo el razonamiento del analis
 **3. PRESUPUESTO DESPERDICIADO (Pregunta 3)**
 - Desperdicio confirmado: Red de Display en Búsqueda, gasto sin clics/conversiones, redes sin conversiones
 - Ineficiencia: campañas o redes con CPA muy superior a la mediana (exceso de costo, no plata perdida)
+- CPA vs objetivo/benchmark (referencia de los objetivos cargados o del histórico)
 - Oportunidad no capturada: campañas limitadas por presupuesto (no es desperdicio)
 - Campañas con volumen insuficiente pero gasto
 
-**4. OPORTUNIDADES DE ESCALA (Pregunta 4)**
-- Campañas limitadas por presupuesto (pierden impression share por presupuesto)
-- Techo adicional estimado y CPA vs mediana de la cuenta
+**4. PRESUPUESTO Y VISIBILIDAD (Pregunta 4)**
+- Campañas que pierden cuota de impresiones por límite de presupuesto
+- Cuota perdida (porcentaje de impresiones, no de dinero), inversión actual e inversión adicional estimada
+- La inversión adicional es una estimación de lo que falta invertir, no plata perdida ni ya gastada
 
-**5. VISIBILIDAD (Pregunta 5)**
-- Campañas perdiendo Impression Share vs benchmark histórico
-- Por ranking vs por presupuesto
+**5. CLICS VS CONVERSIONES (Pregunta 5)**
+- Promedio de conversión de la cuenta (conversiones ÷ clics)
+- Campañas por debajo del promedio: atraen clics que no convierten
+- Campañas por encima del promedio: convierten mejor de lo esperado para su tráfico
+- La referencia es el promedio de la cuenta, no un benchmark externo
 
-**6. CLICS VS CONVERSIONES (Pregunta 6)**
-- CTR alto/bajo vs benchmark
-- Tasa conversión cayendo con clics estables (landing/oferta)
-
-**7. CPA ALTO (Pregunta 7)**
-- Campañas con CPA significativamente sobre benchmark
-- Outliers críticos de CPA
-
-**8. DATOS INSUFICIENTES (Pregunta 8)**
+**6. DATOS INSUFICIENTES (Pregunta 6)**
 - Campañas nuevas (<7 días) o bajo volumen
 
-**9. TOP 5 HALLAZGOS (Pregunta 9)**
-- Los 2-5 hallazgos más relevantes priorizados por score (impacto × magnitud)
+**7. PLAN DE ACCIÓN (Pregunta 7)**
+- Hallazgos priorizados por score (impacto × magnitud), máximo 5
 - Outliers críticos siempre incluidos
+- Qué pasó y acción sugerida por campaña
 
 Reglas estrictas:
-- NO des recomendaciones de acción ("subir presupuesto", "pausar campaña")
+- NO inventes recomendaciones nuevas: usá solo las acciones sugeridas en el plan del reporte
 - SOLO reportá patrones detectados: "Campaña X tiene CPA 40% sobre benchmark"
 - Usá nombres reales de campañas y métricas con valores
 - Tono: profesional, objetivo, analítico
@@ -226,7 +223,7 @@ def build_report_context(
 ) -> str:
     """
     Construye contexto comprimido para el LLM (~800 tokens).
-    Estructurado según las 9 preguntas del roadmap.
+    Estructurado según las 7 preguntas del roadmap.
     """
     total_spend = df_campaign["spend_usd"].sum()
     total_conv = df_campaign["conversions"].sum()
@@ -257,6 +254,12 @@ def build_report_context(
     def extract_msg(insights_list, max_chars=100):
         return "; ".join([getattr(i, 'answer', '')[:max_chars] for i in insights_list[:3]])
 
+    def insight_by_number(number):
+        for ins in insights:
+            if getattr(ins, "question_number", None) == number:
+                return ins
+        return None
+
     # Pregunta 3: Presupuesto desperdiciado
     disp = find_insights(["display", "red de display"])
     spend_nr = find_insights(["gasto sin", "sin clic", "sin convers"])
@@ -273,44 +276,60 @@ def build_report_context(
         p3_parts.append("Oportunidad no capturada por presupuesto (no es desperdicio)")
     p3 = f"3. DESPERDICIO: {'; '.join(p3_parts) if p3_parts else 'Sin desperdicios detectados'}"
 
-    # Pregunta 4: Oportunidades de escala
-    scale = find_insights(["escalar inversión", "limitadas por presupuesto"])
-    p4 = f"4. ESCALA: {extract_msg(scale) if scale else 'Sin oportunidades claras'}"
+    # Pregunta 4: Presupuesto y visibilidad (fusión de los antiguos 4 y 5)
+    budget_vis = insight_by_number(4)
+    p4 = (
+        "4. PRESUPUESTO Y VISIBILIDAD: "
+        f"{extract_msg([budget_vis]) if budget_vis else 'Sin campañas limitadas por presupuesto'}"
+    )
 
-    # Pregunta 5: Visibilidad
-    vis = find_insights(["visibilidad", "impression share", "impr share", "cuota de impres"])
-    p5 = f"5. VISIBILIDAD: {extract_msg(vis) if vis else 'Sin pérdidas significativas de IS'}"
+    # Pregunta 5: Clics vs conversiones
+    p5_insight = insight_by_number(5)
+    if p5_insight:
+        data = getattr(p5_insight, "supporting_data", {}) or {}
+        sinks = len(data.get("click_sinks") or [])
+        efficient = len(data.get("efficient_low_traffic") or [])
+        account_cvr = data.get("account_cvr")
+        p5_parts = []
+        if account_cvr is not None:
+            cvr_pct = account_cvr * 100
+            decimals = 2 if cvr_pct < 1 else 1
+            p5_parts.append(
+                "Promedio de la cuenta "
+                + f"{cvr_pct:.{decimals}f}".replace(".", ",")
+                + "%"
+            )
+        if sinks:
+            p5_parts.append(
+                f"{sinks} {'campaña' if sinks == 1 else 'campañas'} "
+                "por debajo del promedio"
+            )
+        if efficient:
+            p5_parts.append(
+                f"{efficient} {'campaña' if efficient == 1 else 'campañas'} "
+                "por encima del promedio"
+            )
+        p5_detail = "; ".join(p5_parts) or "Sin desbalances claros"
+    else:
+        p5_detail = "Sin datos suficientes"
+    p5 = f"5. CLICS VS CONV: {p5_detail}"
 
-    # Pregunta 6: Clicks vs Conversiones
-    ctr_f = find_insights(["ctr", "tasa de clic"])
-    cvr_f = find_insights(["tasa de convers", "conversion rate", "conversiones vs"])
-    p6_parts = []
-    if ctr_f:
-        p6_parts.append(f"CTR: {len(ctr_f)} variación(es)")
-    if cvr_f:
-        p6_parts.append(f"Tasa conv: {len(cvr_f)} variación(es)")
-    p6 = f"6. CLICS VS CONV: {'; '.join(p6_parts) if p6_parts else 'CTR y tasa conv en rangos normales'}"
+    # Pregunta 6: Datos insuficientes
+    insuff = insight_by_number(6)
+    p6 = f"6. DATOS INSUFICIENTES: {extract_msg([insuff]) if insuff else 'Todas con datos suficientes'}"
 
-    # Pregunta 7: CPA alto
-    cpa_f = find_insights(["cpa alto", "cpa elevad", "costo por resultado", "sobre benchmark"])
-    p7 = f"7. CPA ALTO: {extract_msg(cpa_f) if cpa_f else 'CPAs en rangos normales'}"
-
-    # Pregunta 8: Datos insuficientes
-    insuff = find_insights(["insuficiente", "esperar", "pocos datos"])
-    p8 = f"8. DATOS INSUFICIENTES: {extract_msg(insuff) if insuff else 'Todas con datos suficientes'}"
-
-    # Pregunta 9: Top hallazgos
+    # Pregunta 7: Plan de acción
     if scored_findings:
         findings_text = []
         for i, f in enumerate(scored_findings[:top_n], 1):
             outlier = " ⚡" if getattr(f, 'is_outlier', False) else ""
             findings_text.append(f"{i}. {f.rule_name} ({f.campaign}){outlier}: {f.message[:120]}")
-        p9 = "9. TOP 5 HALLAZGOS:\n" + "\n".join(findings_text)
+        p7 = "7. PLAN DE ACCIÓN:\n" + "\n".join(findings_text)
     else:
-        top_h = find_insights(["top ", "hallazg", "relevant"])
-        p9 = f"9. TOP HALLAZGOS: {extract_msg(top_h) if top_h else 'Ver lista completa'}"
+        top_h = find_insights(["plan de acción", "hallazg", "relevant"])
+        p7 = f"7. PLAN DE ACCIÓN: {extract_msg(top_h) if top_h else 'Ver lista completa'}"
 
-    return "\n\n".join([p1, p2, p3, p4, p5, p6, p7, p8, p9])
+    return "\n\n".join([p1, p2, p3, p4, p5, p6, p7])
 
 
 def generate_llm_narrative(
