@@ -156,7 +156,7 @@ def detect_metric_outliers_zscore(
                 findings.append(OutlierFinding(
                     campaign=campaign,
                     outlier_type=f"{metric}_extreme",
-                    severity="critical",
+                    severity="high",
                     message=(
                         f"La campaña '{campaign}' tiene {metric.upper()} que {direction} "
                         f"{abs(variation):.0%} vs benchmark ({bench:.4f} → {current:.4f}). "
@@ -212,7 +212,7 @@ def detect_statistical_outliers(
                 findings.append(OutlierFinding(
                     campaign=row["campaign"],
                     outlier_type=f"{metric}_statistical_outlier",
-                    severity="high",
+                    severity="low",
                     message=(
                         f"La campaña '{row['campaign']}' tiene {metric.upper()} "
                         f"{direction} del promedio de la cuenta "

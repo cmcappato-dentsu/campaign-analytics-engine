@@ -157,6 +157,25 @@ def score_finding(
     current_value = _get(finding, 'metric_value')
     persistence_count = _get(finding, 'persistence_count', 1)
 
+    # Los outliers guardan su referencia en threshold_value. Se usa como
+    # benchmark para que el plan de acción pueda mostrar real vs. referencia.
+    if benchmark_value is None:
+        benchmark_value = _get(finding, 'threshold_value')
+
+    if (
+        variation_pct is None
+        and benchmark_value is not None
+        and current_value is not None
+    ):
+        try:
+            benchmark_float = float(benchmark_value)
+            if benchmark_float != 0:
+                variation_pct = (
+                    float(current_value) - benchmark_float
+                ) / benchmark_float
+        except (TypeError, ValueError):
+            variation_pct = None
+
     # Identificar métrica principal del hallazgo
     metric = _extract_metric_from_rule(rule_id)
 
@@ -177,10 +196,11 @@ def score_finding(
     # Total score
     total_score = base_score + severity_score + multi_metric + persistence_bonus
 
-    # Outliers críticos siempre tienen score alto
+    # Outliers: el boost es mayor solo para los críticos confirmados, para que
+    # no todos los hallazgos extremos queden empatados en el tope.
     is_outlier = _get(finding, 'is_outlier', False) or _get(finding, 'outlier_type', None) is not None
     if is_outlier:
-        total_score += 200  # Boost para outliers críticos
+        total_score += 200 if severity == FindingSeverity.CRITICAL else 80
 
     return ScoredFinding(
         rule_id=rule_id,
@@ -225,6 +245,85 @@ def _extract_metric_from_rule(rule_id: str) -> str:
     return "unknown"
 
 
+def _finding_metric_name(finding) -> str:
+    """Identifica la métrica del hallazgo, incluso en outliers sin rule_id."""
+
+    rule_id = str(getattr(finding, "rule_id", "") or "").lower()
+    if rule_id:
+        metric = _extract_metric_from_rule(rule_id)
+        if metric != "unknown":
+            return metric
+
+    text = " ".join(
+        str(getattr(finding, attribute, "") or "")
+        for attribute in ("rule_name", "message")
+    ).lower()
+
+    for token, metric in (
+        ("conversion_rate", "conversion_rate"),
+        ("conv_rate", "conversion_rate"),
+        ("tasa de conversión", "conversion_rate"),
+        ("conversions", "conversions"),
+        ("conversión", "conversions"),
+        ("impression_share", "impression_share"),
+        ("impression share", "impression_share"),
+        ("ctr", "ctr"),
+        ("cpc", "cpc"),
+        ("cpa", "cpa"),
+        ("spend_usd", "spend"),
+    ):
+        if token in text:
+            return metric
+
+    return "unknown"
+
+
+_IMPROVEMENT_METRICS = {
+    "ctr",
+    "conversion_rate",
+    "conversions",
+    "clicks",
+    "impression_share",
+}
+_IMPROVEMENT_WORDS = ("subió", "por encima", "aumentó", "mejoró")
+_WORSENING_WORDS = ("bajó", "por debajo", "colapsó", "cayó", "baja")
+
+
+def is_positive_finding(finding) -> bool:
+    """Indica si el hallazgo describe una mejora y no un problema.
+
+    Un CTR o una tasa de conversión por encima de la referencia es una buena
+    noticia: no debería ocupar un lugar en el plan de acción ni marcarse como
+    crítico. Los CPC/CPA por debajo de la referencia también son mejoras.
+    """
+
+    rule_id = str(getattr(finding, "rule_id", "") or "").lower()
+    metric = _finding_metric_name(finding)
+    text = " ".join(
+        str(getattr(finding, attribute, "") or "")
+        for attribute in ("rule_name", "message")
+    ).lower()
+
+    if "ctr_high" in rule_id:
+        return True
+    if "_drop" in rule_id or "_low" in rule_id:
+        return False
+    if rule_id.endswith("_high"):
+        # CPC/CPA por encima de la referencia es un problema.
+        return False
+
+    improved = any(word in text for word in _IMPROVEMENT_WORDS)
+    worsened = any(word in text for word in _WORSENING_WORDS)
+
+    if metric in {"cpc", "cpa"}:
+        return worsened and not improved
+
+    if not improved or worsened:
+        return False
+
+    return metric in _IMPROVEMENT_METRICS
+
+
 def prioritize_findings(
     findings: list,
     df_campaign: pd.DataFrame,
@@ -234,13 +333,22 @@ def prioritize_findings(
     """
     Prioriza hallazgos y retorna top N.
     Roadmap: "Techo por corrida: reportar como máximo 5 hallazgos (top 5 por score).
-    Los outliers críticos siempre entran al top, independientemente del score."
+    Los outliers críticos siempre entran al top, independientemente del score.
     """
     if not findings:
         return []
 
+    # El plan de acción solo incluye problemas. Una mejora (CTR alto, CPA bajo)
+    # no requiere acción y no debe desplazar a los hallazgos que sí importan.
+    actionable = [finding for finding in findings if not is_positive_finding(finding)]
+    if not actionable:
+        return []
+
     # Scored all findings
-    scored = [score_finding(f, df_campaign, findings, impact_metric) for f in findings]
+    scored = [
+        score_finding(finding, df_campaign, actionable, impact_metric)
+        for finding in actionable
+    ]
 
     # Separar outliers críticos
     outliers = [s for s in scored if s.is_outlier]

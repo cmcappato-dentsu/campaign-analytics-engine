@@ -386,7 +386,9 @@ def _add_finding_if_persistent(
     is_outlier = abs(variation) > (2 * _get_threshold_for_metric(metric))
 
     if persistence_count >= DiagnosticRules.PERSISTENCE_MIN_PERIODS or is_outlier:
-        severity = "critical" if is_outlier else "high"
+        # Crítico se reserva para desperdicio confirmado (gasto sin resultados).
+        # Un desvío extremo contra la referencia es "alto"; uno persistente, "medio".
+        severity = "high" if is_outlier else "medium"
         findings.append(DiagnosticFinding(
             campaign=campaign,
             rule_id=rule_id,

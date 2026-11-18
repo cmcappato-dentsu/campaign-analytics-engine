@@ -118,8 +118,11 @@ def generate_top_campaigns_summary(
     top_spend = df_campaign.nlargest(effective_n, "spend_usd")
     top_conv = df_campaign.nlargest(effective_n, "conversions")
 
-    spend_pct = top_spend["spend_usd"].sum() / df_campaign["spend_usd"].sum() * 100 if df_campaign["spend_usd"].sum() > 0 else 0
-    conv_pct = top_conv["conversions"].sum() / df_campaign["conversions"].sum() * 100 if df_campaign["conversions"].sum() > 0 else 0
+    spend_total = df_campaign["spend_usd"].sum()
+    conv_total = df_campaign["conversions"].sum()
+
+    spend_pct = top_spend["spend_usd"].sum() / spend_total * 100 if spend_total > 0 else 0
+    conv_pct = top_conv["conversions"].sum() / conv_total * 100 if conv_total > 0 else 0
 
     if total_campaigns <= top_n:
         lines = [
@@ -136,24 +139,35 @@ def generate_top_campaigns_summary(
             f"",
         ]
 
-    for _, row in top_spend.iterrows():
-        lines.append(f"- **{row['campaign']}**: {format_currency(row['spend_usd'])} ({row['spend_usd']/df_campaign['spend_usd'].sum()*100:.1f}% del total)")
+    # Tabla única con la unión de las campañas top por inversión y por conversiones.
+    ordered_campaigns = list(dict.fromkeys([
+        *top_spend["campaign"].tolist(),
+        *top_conv["campaign"].tolist(),
+    ]))
+    indexed = df_campaign.set_index("campaign")
 
-    if total_campaigns <= top_n:
-        lines.extend([
-            f"",
-            f"De la misma forma, las conversiones se reparten entre las **{total_campaigns} campañas**:",
-            f"",
-        ])
-    else:
-        lines.extend([
-            f"",
-            f"Las **{effective_n} campañas con más conversiones** concentran el **{conv_pct:.0f}%** de los resultados:",
-            f"",
-        ])
+    lines.append(
+        "| Campaña | Inversión | % de la inversión | Conversiones | "
+        "% de las conversiones |"
+    )
+    lines.append("| --- | --- | --- | --- | --- |")
+    for campaign in ordered_campaigns:
+        row = indexed.loc[campaign]
+        spend = row["spend_usd"]
+        conversions = row["conversions"]
+        spend_share = spend / spend_total if spend_total > 0 else 0
+        conv_share = conversions / conv_total if conv_total > 0 else 0
+        lines.append(
+            f"| **{campaign}** | {format_currency(spend)} | "
+            f"{format_percentage(spend_share)} | {format_number(conversions)} | "
+            f"{format_percentage(conv_share)} |"
+        )
 
-    for _, row in top_conv.iterrows():
-        lines.append(f"- **{row['campaign']}**: {format_number(row['conversions'])} conv. ({row['conversions']/df_campaign['conversions'].sum()*100:.1f}% del total)")
+    lines.extend([
+        f"",
+        f"Las **{effective_n} campañas con más conversiones** concentran el "
+        f"**{conv_pct:.0f}%** de los resultados.",
+    ])
 
     return "\n".join(lines)
 
@@ -778,6 +792,31 @@ def generate_budget_visibility_insight(
         "inversión. Antes de ejecutarla hay que validar capacidad, objetivos y "
         "eficiencia."
     )
+    lines.append("")
+    lines.append("**Cómo se calcula**")
+    lines.append("")
+    lines.append("```text")
+    lines.append("inversión adicional = inversión actual × cuota perdida / (1 − cuota perdida)")
+    lines.append("```")
+    lines.append("")
+    lines.append(
+        "La lógica: si la campaña ya invierte lo suficiente para cubrir "
+        "`1 − cuota perdida` de las impresiones posibles, para cubrir el 100% "
+        "hace falta multiplicar la inversión por `1 / (1 − cuota perdida)`. "
+        "La diferencia contra la inversión actual es la inversión adicional."
+    )
+    lines.append("")
+    lines.append(
+        "**Ejemplo:** una campaña con **USD 1.000** de inversión y **50%** de "
+        "cuota perdida necesita `1.000 × 0,50 / (1 − 0,50)` = **USD 1.000** "
+        "adicionales para duplicar sus impresiones."
+    )
+    lines.append("")
+    lines.append(
+        "La cuota perdida se toma como promedio ponderado por impresiones y se "
+        "limita a **90%**, porque al 100% la fórmula no tendría tope. El cálculo "
+        "asume que el costo por impresión no cambia al invertir más."
+    )
 
     return "\n".join(lines)
 
@@ -1172,31 +1211,153 @@ def generate_insufficient_data_insight(
     return "\n".join(lines)
 
 
-def _action_for_finding(finding) -> str:
-    """Sugiere una acción concreta según el tipo de hallazgo."""
+def _finding_text(finding) -> str:
+    """Texto del hallazgo sin el nombre de la campaña (evita falsos positivos)."""
 
     text = " ".join(
         str(getattr(finding, attribute, "") or "")
         for attribute in ("rule_id", "rule_name", "message")
     ).lower()
 
+    campaign = str(getattr(finding, "campaign", "") or "").lower()
+    if campaign:
+        # El mensaje suele citar el nombre entre comillas; se quita solo esa
+        # mención para no alterar el resto del texto.
+        text = text.replace(f"'{campaign}'", " ")
+        text = text.replace(f"\"{campaign}\"", " ")
+
+    return text
+
+
+def _action_for_finding(finding) -> str:
+    """Sugiere una acción concreta según el tipo de hallazgo."""
+
+    text = _finding_text(finding)
+
     if "display" in text or "red de display" in text:
-        return "Desactivar Red de Display o revisar segmentación"
-    if "sin clic" in text or "sin convers" in text or "spend_no" in text:
+        return "Desactivar Red de Display"
+    if (
+        "sin clic" in text
+        or "ni un solo clic" in text
+        or "sin convers" in text
+        or "0 conversiones" in text
+        or "spend_no" in text
+    ):
         return "Pausar y revisar configuración/tracking"
     if "cpa" in text:
-        return "Revisar pujas, palabras clave y segmentación"
+        return "Revisar pujas y segmentación"
     if "cpc" in text:
-        return "Revisar competencia, calidad y pujas"
+        return "Revisar competencia y pujas"
     if "ctr" in text:
-        return "Revisar anuncios, palabras clave y calidad del tráfico"
+        return "Revisar anuncios y palabras clave"
     if "conversion" in text or "tasa" in text:
-        return "Revisar landing page, oferta y tracking"
-    if "impression" in text or "impres" in text or "visibilidad" in text:
+        return "Revisar landing page y tracking"
+    if (
+        "impression" in text
+        or "impres" in text
+        or "visibilidad" in text
+        or "presupuesto" in text
+    ):
         return "Revisar presupuesto y ranking"
     if "pareto" in text or "concentra" in text:
         return "Revisar distribución de presupuesto"
     return "Revisar campaña"
+
+
+_FINDING_RATE_METRICS = {"ctr", "conversion_rate", "impression_share"}
+_FINDING_MONEY_METRICS = {"cpc", "cpa", "spend"}
+
+
+def _finding_metric_key(finding) -> str:
+    """Identifica la métrica del hallazgo a partir de su texto."""
+
+    text = _finding_text(finding)
+
+    if "display" in text:
+        return "config"
+    if "spend_no" in text or "gastó" in text or "spend_usd" in text:
+        return "spend"
+    if (
+        "conversion_rate" in text
+        or "conv_rate" in text
+        or "tasa de conversión" in text
+    ):
+        return "conversion_rate"
+    if "conversions" in text or "conversión" in text or "conversiones" in text:
+        return "conversions"
+    if (
+        "impression_share" in text
+        or "impr_share" in text
+        or "lost_is" in text
+        or "cuota de impresiones" in text
+        or "visibilidad" in text
+        or "presupuesto insuficiente" in text
+    ):
+        return "impression_share"
+    if "ctr" in text:
+        return "ctr"
+    if "cpc" in text:
+        return "cpc"
+    if "cpa" in text:
+        return "cpa"
+    return "unknown"
+
+
+def _finding_label(finding, metric_key: str) -> str:
+    """Etiqueta corta y accionable para la columna Hallazgo."""
+
+    text = _finding_text(finding)
+
+    if metric_key == "config":
+        return "Display activo"
+    if metric_key == "spend":
+        if "convers" in text:
+            return "Gasto sin conversiones"
+        if "clic" in text:
+            return "Gasto sin clics"
+        return "Inversión atípica"
+    if metric_key == "ctr":
+        if "low" in text or "bajó" in text or "por debajo" in text:
+            return "CTR bajo"
+        return "CTR alto"
+    if metric_key == "cpc":
+        return "CPC alto"
+    if metric_key == "cpa":
+        return "CPA alto"
+    if metric_key == "conversion_rate":
+        return "Tasa de conversión baja"
+    if metric_key == "conversions":
+        return "Menos conversiones"
+    if metric_key == "impression_share":
+        if "presupuesto" in text:
+            return "Presupuesto insuficiente"
+        return "Menos visibilidad"
+    return "Hallazgo"
+
+
+def _finding_metric_values(finding) -> dict:
+    values = getattr(finding, "metric_values", None)
+    return values if isinstance(values, dict) else {}
+
+
+def _format_finding_value(value, metric_key: str) -> str:
+    """Formatea el valor de una métrica según su tipo."""
+
+    if value is None or pd.isna(value):
+        return "—"
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "—"
+
+    if metric_key in _FINDING_RATE_METRICS:
+        return format_percentage(numeric)
+    if metric_key in _FINDING_MONEY_METRICS:
+        return format_currency(numeric)
+    if metric_key == "conversions":
+        return _conversions_text(numeric)
+    return format_number(numeric, decimals=2)
 
 
 def generate_top_findings_summary(
@@ -1213,20 +1374,47 @@ def generate_top_findings_summary(
         lines.append("✅ No se generaron hallazgos prioritarios en esta corrida.")
         return "\n".join(lines)
 
-    severity_meta = {
-        "critical": "🔴 Crítico",
-        "high": "🟠 Alto",
-        "medium": "🟡 Medio",
-        "low": "🟢 Bajo",
+    severity_icons = {
+        "critical": "🔴",
+        "high": "🟠",
+        "medium": "🟡",
+        "low": "🟢",
     }
 
     lines.append(
-        "Estas son las acciones con mayor impacto según el peso de la campaña "
-        "y la magnitud del desvío."
+        "Estas son las acciones con mayor impacto, ordenadas por prioridad. "
+        "El nombre de la campaña aparece una sola vez y el detalle se separa "
+        "en valor real, referencia y variación."
     )
     lines.append("")
-    lines.append("| # | Campaña | Qué pasó | Acción sugerida | Severidad |")
-    lines.append("| --- | --- | --- | --- | --- |")
+    lines.append("**Cómo se asigna la severidad**")
+    lines.append("")
+    lines.append(
+        "- 🔴 **Crítico:** gasto sin clics o sin conversiones (desperdicio confirmado)."
+    )
+    lines.append(
+        "- 🟠 **Alto:** desvío negativo extremo contra la referencia "
+        "(más del doble del umbral)."
+    )
+    lines.append(
+        "- 🟡 **Medio:** desvío negativo persistente por encima del umbral."
+    )
+    lines.append(
+        "- 🟢 **Bajo:** comportamiento atípico contra el promedio de la cuenta "
+        "(informativo)."
+    )
+    lines.append("")
+    lines.append(
+        "Los hallazgos que describen una mejora (CTR o tasa de conversión por "
+        "encima de la referencia, CPA o CPC por debajo) no se incluyen: no "
+        "requieren acción."
+    )
+    lines.append("")
+    lines.append(
+        "| # | Severidad | Campaña | Hallazgo | Real | Referencia | "
+        "Variación | Acción |"
+    )
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
 
     ordered = sorted(
         scored_findings,
@@ -1236,17 +1424,40 @@ def generate_top_findings_summary(
     for index, finding in enumerate(ordered, 1):
         severity = finding.severity
         severity_key = getattr(severity, "value", severity)
-        severity_text = severity_meta.get(str(severity_key), str(severity_key))
-        what_happened = (
-            finding.message
-            or finding.rule_name
-            or finding.rule_id
-            or "—"
+        icon = severity_icons.get(str(severity_key), "⚪")
+
+        metric_key = _finding_metric_key(finding)
+        values = _finding_metric_values(finding)
+        current = values.get("current_value")
+        benchmark = values.get("benchmark_value")
+        variation = values.get("variation_pct")
+
+        if metric_key == "config":
+            real_text = "—"
+            reference_text = "—"
+        else:
+            real_text = _format_finding_value(current, metric_key)
+            reference_text = _format_finding_value(benchmark, metric_key)
+
+        variation_text = (
+            _signed_percentage(variation)
+            if benchmark is not None and variation is not None
+            else "—"
         )
+
         lines.append(
-            f"| {index} | **{finding.campaign}** | {what_happened} | "
-            f"{_action_for_finding(finding)} | {severity_text} |"
+            f"| {index} | {icon} | **{finding.campaign}** | "
+            f"{_finding_label(finding, metric_key)} | {real_text} | "
+            f"{reference_text} | {variation_text} | "
+            f"{_action_for_finding(finding)} |"
         )
+
+    lines.append("")
+    lines.append(
+        "**Cómo leer:** *Real* es el valor actual de la campaña; *Referencia* "
+        "es el benchmark u objetivo; *Variación* es el desvío porcentual de Real "
+        "contra Referencia. Si no hay referencia disponible, se muestra —."
+    )
 
     return "\n".join(lines)
 

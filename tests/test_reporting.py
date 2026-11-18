@@ -9,9 +9,11 @@ from src.reporting import (
     generate_budget_visibility_insight,
     generate_clicks_vs_conversions_insight,
     generate_insufficient_data_insight,
+    generate_top_campaigns_summary,
     generate_top_findings_summary,
     generate_wasted_budget_insight,
 )
+from src.scoring import is_positive_finding, prioritize_findings
 
 
 def _eligibility(campaigns):
@@ -106,6 +108,13 @@ def test_budget_visibility_explains_lost_share_and_extra_investment():
     assert "cuánto falta invertir" in text
     assert "no a \"cuánto se invirtió de más\"" in text
     assert "no es plata perdida" in text
+    assert "**Cómo se calcula**" in text
+    assert (
+        "inversión adicional = inversión actual × cuota perdida / "
+        "(1 − cuota perdida)"
+    ) in text
+    assert "USD 1.000** adicionales" in text
+    assert "limita a **90%**" in text
 
 
 def test_budget_visibility_orders_by_lost_share():
@@ -626,32 +635,124 @@ def test_top_findings_renders_prioritized_action_plan():
         types.SimpleNamespace(
             rule_id="benchmark_cpa_high",
             rule_name="CPA sobre el benchmark",
-            message="CPA 100% sobre el objetivo",
+            message="El CPA subió 287% sobre el benchmark (8.50 → 32.86).",
             campaign="A",
             severity="critical",
             total_score=311.0,
+            metric_values={
+                "variation_pct": 2.866,
+                "benchmark_value": 8.5,
+                "current_value": 32.86,
+            },
         ),
         types.SimpleNamespace(
             rule_id="config_display_in_search",
             rule_name="Red de Display en campaña de Búsqueda",
-            message="Display activada en una campaña de Búsqueda",
+            message="La campaña 'B' tiene Red de Display activada.",
             campaign="B",
             severity="high",
             total_score=95.0,
+            metric_values={},
         ),
     ]
 
     text = generate_top_findings_summary(findings)
 
-    assert "| # | Campaña | Qué pasó | Acción sugerida | Severidad |" in text
     assert (
-        "| 1 | **A** | CPA 100% sobre el objetivo | "
-        "Revisar pujas, palabras clave y segmentación | 🔴 Crítico |"
+        "| # | Severidad | Campaña | Hallazgo | Real | Referencia | "
+        "Variación | Acción |"
+    ) in text
+    assert "**Cómo se asigna la severidad**" in text
+    assert "no se incluyen: no requieren acción" in text
+    assert (
+        "| 1 | 🔴 | **A** | CPA alto | USD 32,86 | USD 8,50 | +286,6% | "
+        "Revisar pujas y segmentación |"
     ) in text
     assert (
-        "| 2 | **B** | Display activada en una campaña de Búsqueda | "
-        "Desactivar Red de Display o revisar segmentación | 🟠 Alto |"
+        "| 2 | 🟠 | **B** | Display activo | — | — | — | "
+        "Desactivar Red de Display |"
     ) in text
+    # El nombre de la campaña aparece una sola vez por fila.
+    assert text.count("**A**") == 1
+    assert "La campaña 'A'" not in text
+
+
+def test_top_findings_formats_spend_without_conversions_outlier():
+    finding = types.SimpleNamespace(
+        rule_id="",
+        rule_name="",
+        message=(
+            "La campaña 'A' gastó $1,438.12 con 12 clics pero 0 conversiones."
+        ),
+        campaign="A",
+        severity="critical",
+        total_score=500.0,
+        metric_values={
+            "variation_pct": None,
+            "benchmark_value": None,
+            "current_value": 1438.12,
+        },
+    )
+
+    text = generate_top_findings_summary([finding])
+
+    assert (
+        "| 1 | 🔴 | **A** | Gasto sin conversiones | USD 1.438,12 | — | — | "
+        "Pausar y revisar configuración/tracking |"
+    ) in text
+
+
+def test_positive_findings_are_excluded_from_action_plan():
+    df_campaign = pd.DataFrame({
+        "campaign": ["A", "B"],
+        "spend_usd": [1000.0, 1000.0],
+    })
+    findings = [
+        types.SimpleNamespace(
+            rule_id="benchmark_ctr_high",
+            rule_name="CTR sobre el benchmark",
+            message="El CTR subió 60% en A.",
+            campaign="A",
+            severity="high",
+            variation_pct=0.60,
+            metric_value=0.05,
+            benchmark_value=0.03,
+            persistence_count=2,
+        ),
+        types.SimpleNamespace(
+            rule_id="benchmark_cpa_high",
+            rule_name="CPA sobre el benchmark",
+            message="El CPA subió 150% en B.",
+            campaign="B",
+            severity="high",
+            variation_pct=1.50,
+            metric_value=25.0,
+            benchmark_value=10.0,
+            persistence_count=2,
+        ),
+    ]
+
+    scored = prioritize_findings(findings, df_campaign, max_findings=5)
+
+    assert [finding.campaign for finding in scored] == ["B"]
+
+
+def test_positive_finding_detection():
+    positive = types.SimpleNamespace(
+        rule_id="benchmark_ctr_high",
+        rule_name="CTR sobre el benchmark",
+        message="El CTR subió 60% en A.",
+        campaign="A",
+    )
+    negative = types.SimpleNamespace(
+        rule_id="benchmark_cpa_high",
+        rule_name="CPA sobre el benchmark",
+        message="El CPA subió 150% en B.",
+        campaign="B",
+    )
+
+    assert is_positive_finding(positive)
+    assert not is_positive_finding(negative)
 
 
 def test_top_findings_orders_by_score():
@@ -708,3 +809,20 @@ def test_low_volume_spend_with_spend_column_in_eligibility_does_not_break():
 
     assert "Riesgo: campañas con volumen insuficiente" in text
     assert "USD 200,00" in text
+
+
+def test_top_campaigns_renders_combined_table():
+    df_campaign = _campaign_frame([
+        {"campaign": "A", "spend_usd": 600.0, "conversions": 30.0},
+        {"campaign": "B", "spend_usd": 300.0, "conversions": 60.0},
+        {"campaign": "C", "spend_usd": 100.0, "conversions": 10.0},
+    ])
+
+    text = generate_top_campaigns_summary(df_campaign, top_n=2)
+
+    assert (
+        "| Campaña | Inversión | % de la inversión | Conversiones | "
+        "% de las conversiones |"
+    ) in text
+    assert "| **A** | USD 600,00 | 60,0% | 30 | 30,0% |" in text
+    assert "| **B** | USD 300,00 | 30,0% | 60 | 60,0% |" in text

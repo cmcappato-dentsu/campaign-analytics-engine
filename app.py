@@ -553,10 +553,10 @@ with tab_insights:
             if insight.question_number == 3:
                 _render_remaining_inefficiency(insight)
 
-    # Botón descargar reporte completo
+    # Botón descargar reporte completo (Markdown)
     markdown_report = format_report_markdown(insights)
     st.download_button(
-        "📥 Descargar reporte completo (Markdown)",
+        "📄 Descargar reporte completo (Markdown)",
         markdown_report.encode("utf-8"),
         file_name="reporte_miau.md",
         mime="text/markdown",
