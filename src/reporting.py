@@ -6,6 +6,7 @@ from typing import Optional
 from dataclasses import dataclass, field
 
 from config.thresholds import (
+    MIN_CLICKS_FOR_ANALYSIS,
     WASTE_CPA_MEDIAN_MULTIPLIER,
     WASTE_LOST_IS_BUDGET_THRESHOLD,
     WASTE_MIN_CAMPAIGNS_FOR_MEDIAN,
@@ -503,6 +504,7 @@ def generate_wasted_budget_insight(
     network_available: bool = True,
     df_daily: pd.DataFrame | None = None,
     analysis: dict | None = None,
+    cpa_findings: list | None = None,
 ) -> str:
     """Pregunta 3: ¿Hay presupuesto que se está desperdiciando (ej. Display en Búsqueda)?"""
 
@@ -535,6 +537,7 @@ def generate_wasted_budget_insight(
         lines.append("| --- | --- | --- | --- |")
 
         display_metrics = _display_network_metrics_by_campaign(df_daily)
+        display_rows = []
         for finding in display_findings:
             labels = _display_network_labels(df_daily, finding.campaign)
             metrics = display_metrics.get(finding.campaign)
@@ -542,9 +545,11 @@ def generate_wasted_budget_insight(
             network_text = ", ".join(labels) if labels else "—"
 
             if metrics is None:
+                spend_value = -1.0
                 spend_text = "—"
                 result_text = "—"
             else:
+                spend_value = float(metrics["spend"])
                 spend_text = format_currency(metrics["spend"])
                 if "conversions" not in metrics.index or pd.isna(metrics["conversions"]):
                     result_text = "—"
@@ -553,9 +558,13 @@ def generate_wasted_budget_insight(
                 else:
                     result_text = f"{format_number(metrics['conversions'])} conversiones"
 
-            lines.append(
+            row_text = (
                 f"| **{finding.campaign}** | {network_text} | {spend_text} | {result_text} |"
             )
+            display_rows.append((spend_value, row_text))
+
+        for _, row_text in sorted(display_rows, key=lambda item: item[0], reverse=True):
+            lines.append(row_text)
 
         lines.append("")
         lines.append(
@@ -567,14 +576,24 @@ def generate_wasted_budget_insight(
     # Gasto sin resultados
     if spend_no_results_findings:
         lines.append(f"🔴 **Gasto sin resultados (clics/conversiones = 0)**:")
-        for f in spend_no_results_findings:
+        ordered_spend_no_results = sorted(
+            spend_no_results_findings,
+            key=lambda finding: finding.metric_value or 0,
+            reverse=True,
+        )
+        for f in ordered_spend_no_results:
             lines.append(f"   - {f.message}")
         lines.append(f"")
 
     # Redes con gasto y sin conversiones
     if analysis["network_zero_conversion"]:
         lines.append("🔴 **Redes con gasto y 0 conversiones**:")
-        for row in analysis["network_zero_conversion"]:
+        ordered_network_zero = sorted(
+            analysis["network_zero_conversion"],
+            key=lambda row: row["spend"],
+            reverse=True,
+        )
+        for row in ordered_network_zero:
             lines.append(
                 f"   - **{row['campaign']}** en la red \"{row['network']}\": "
                 f"{format_currency(row['spend'])} "
@@ -588,9 +607,10 @@ def generate_wasted_budget_insight(
         (eligibility_df["is_eligible"] == False)
     ]
     if not low_volume_spend.empty:
-        total_wasted = low_volume_spend.merge(
-            df_campaign[["campaign", "spend_usd"]], on="campaign"
-        )["spend_usd"].sum()
+        low_volume_names = set(low_volume_spend["campaign"])
+        total_wasted = df_campaign[
+            df_campaign["campaign"].isin(low_volume_names)
+        ]["spend_usd"].sum()
         lines.append(f"⚪ **Riesgo: campañas con volumen insuficiente para análisis pero con gasto**: {format_currency(total_wasted)} en {len(low_volume_spend)} campañas.")
         lines.append("   Estas campañas no generan señal estadística confiable. Revisar si mantener activas.")
 
@@ -629,13 +649,22 @@ def generate_wasted_budget_insight(
             lines.append("")
             lines.append("| Campaña | Red | CPA red | CPA campaña | Gasto |")
             lines.append("| --- | --- | --- | --- | --- |")
-            for row in network_inefficient[:INEFFICIENCY_TABLE_LIMIT]:
+            ordered_network_inefficient = sorted(
+                network_inefficient,
+                key=lambda row: row["spend"],
+                reverse=True,
+            )
+            for row in ordered_network_inefficient[:INEFFICIENCY_TABLE_LIMIT]:
                 lines.append(
                     f"| **{row['campaign']}** | {row['network']} | "
                     f"{format_currency(row['cpa'])} | {format_currency(row['campaign_cpa'])} | "
                     f"{format_currency(row['spend'])} |"
                 )
             lines.append("")
+
+    # CPA vs objetivo/benchmark (contenido único del antiguo punto 7)
+    if cpa_findings:
+        lines.extend(_cpa_vs_reference_lines(df_campaign, cpa_findings))
 
     if (
         network_available
@@ -644,6 +673,7 @@ def generate_wasted_budget_insight(
         and not analysis["network_zero_conversion"]
         and not cpa_inefficient
         and not network_inefficient
+        and not cpa_findings
     ):
         lines.append(f"✅ No se detectó desperdicio confirmado ni ineficiencia en esta corrida.")
 
@@ -657,7 +687,7 @@ def generate_wasted_budget_insight(
         lines.append(
             f"🟠 **Oportunidad no capturada (no es desperdicio):** "
             f"{count} {noun} {adjective} por presupuesto. "
-            f"El detalle y el techo estimado están en el **punto 4**."
+            f"El detalle y la inversión adicional estimada están en el **punto 4**."
         )
         lines.append(f"")
 
@@ -665,239 +695,558 @@ def generate_wasted_budget_insight(
 
 
 
-def generate_scale_opportunities(
+def generate_budget_visibility_insight(
     opportunities: list[dict],
-    median_cpa: float | None,
     budget_data_available: bool = True,
 ) -> str:
-    """Pregunta 4: ¿Qué campañas podrían recibir más presupuesto?
+    """Pregunta 4: ¿Qué campañas pierden visibilidad por límite de presupuesto?
 
-    Solo considera campañas limitadas por presupuesto (cuota de impresiones
-    perdida por presupuesto), no campañas eficientes por CPA sin esa señal.
+    Solo usa la cuota de impresiones perdida por presupuesto (`lost_is_budget`) y
+    estima la inversión adicional necesaria para recuperar esas impresiones. No
+    considera pérdida por ranking ni cuota de la parte superior.
     """
 
     lines = [
-        f"**Oportunidades de escalar inversión**",
-        f"",
+        "**Cuota de impresiones perdida por presupuesto**",
+        "",
     ]
 
     if not budget_data_available:
         lines.append(
-            "⚠️ **No se puede medir el techo de inversión:** el reporte no incluye "
-            "la columna de cuota de impresiones perdida por presupuesto "
-            "(`lost_is_budget`). Pedile al proveedor que la incluya para detectar "
-            "campañas limitadas por presupuesto."
+            "⚠️ **No se puede medir la cuota perdida:** el reporte no incluye la "
+            "columna de cuota de impresiones perdida por presupuesto "
+            "(`lost_is_budget`). Pedile al proveedor que la incluya."
         )
         return "\n".join(lines)
 
     if not opportunities:
         lines.append(
             "✅ No se identificaron campañas limitadas por presupuesto "
-            f"(cuota perdida por presupuesto ≥ {format_percentage(WASTE_LOST_IS_BUDGET_THRESHOLD)})."
+            f"(cuota perdida ≥ {format_percentage(WASTE_LOST_IS_BUDGET_THRESHOLD)})."
         )
         return "\n".join(lines)
 
-    total_spend = sum(row["spend"] for row in opportunities)
-    total_upside = sum(row["estimated_upside"] for row in opportunities)
-    count = len(opportunities)
+    ordered = sorted(
+        opportunities,
+        key=lambda row: row["lost_share"],
+        reverse=True,
+    )
+    total_spend = sum(row["spend"] for row in ordered)
+    total_upside = sum(row["estimated_upside"] for row in ordered)
+    count = len(ordered)
     noun = "campaña" if count == 1 else "campañas"
     verb = "pierde" if count == 1 else "pierden"
 
     lines.append(
-        f"Se detectaron **{count} {noun}** que {verb} impresiones "
-        f"por límite de presupuesto (cuota perdida ≥ "
+        f"Se detectaron **{count} {noun}** que {verb} impresiones por límite de "
+        f"presupuesto (cuota perdida ≥ "
         f"{format_percentage(WASTE_LOST_IS_BUDGET_THRESHOLD)})."
     )
-    if median_cpa is not None:
-        lines.append(
-            f"CPA mediano de la cuenta: **{format_currency(median_cpa)}**."
-        )
-    lines.append(
-        f"Inversión actual: **{format_currency(total_spend)}**. "
-        f"Techo adicional estimado: **{format_currency(total_upside)}**."
-    )
     lines.append("")
-
     lines.append(
-        "| Campaña | Cuota perdida por presupuesto | CPA | Inversión actual | Techo estimado | Prioridad |"
+        "| Campaña | Cuota de impresiones perdida por presupuesto | "
+        "Inversión actual | Inversión adicional estimada |"
     )
-    lines.append("| --- | --- | --- | --- | --- | --- |")
-
-    for row in opportunities:
-        cpa_text = (
-            format_currency(row["cpa"]) if row["cpa"] is not None else "—"
-        )
-        if row["efficient"] is True:
-            priority = "🟢 Alta"
-        elif row["efficient"] is False:
-            priority = "🟡 Revisar eficiencia"
-        else:
-            priority = "⚪ Sin referencia"
-
+    lines.append("| --- | --- | --- | --- |")
+    for row in ordered:
         lines.append(
             f"| **{row['campaign']}** | {format_percentage(row['lost_share'])} | "
-            f"{cpa_text} | {format_currency(row['spend'])} | "
-            f"{format_currency(row['estimated_upside'])} | {priority} |"
+            f"{format_currency(row['spend'])} | "
+            f"{format_currency(row['estimated_upside'])} |"
         )
-
     lines.append("")
     lines.append(
-        "El techo estimado es una referencia de cuánto más se podría invertir para "
-        "capturar las impresiones perdidas por presupuesto. No es una recomendación "
-        "automática: validar capacidad, objetivos y eficiencia antes de escalar."
+        f"Total invertido por estas campañas: **{format_currency(total_spend)}**. "
+        f"Inversión adicional estimada en conjunto: **{format_currency(total_upside)}**."
+    )
+    lines.append("")
+    lines.append("**Qué es la cuota perdida**")
+    lines.append("")
+    lines.append(
+        "Es el porcentaje de impresiones que la campaña podría haber recibido y no "
+        "recibió porque se quedó sin presupuesto. Se mide sobre las impresiones, "
+        "no sobre el dinero: no es un porcentaje de la inversión ni plata ya gastada."
+    )
+    lines.append("")
+    lines.append("**Qué es la inversión adicional estimada**")
+    lines.append("")
+    lines.append(
+        "Es cuánto habría que invertir de más para capturar esas impresiones "
+        "perdidas, suponiendo que el costo por impresión se mantiene igual. "
+        "Responde a \"cuánto falta invertir\", no a \"cuánto se invirtió de más\": "
+        "no es plata perdida, no es plata ya gastada y tampoco es una orden de "
+        "inversión. Antes de ejecutarla hay que validar capacidad, objetivos y "
+        "eficiencia."
     )
 
     return "\n".join(lines)
 
 
-def generate_visibility_loss_insight(
-    benchmark_findings: list,
-) -> str:
-    """Pregunta 5: ¿Qué campañas están perdiendo visibilidad frente a la competencia?"""
+def _signed_percentage(value: float) -> str:
+    """Formatea una fracción como porcentaje con signo explícito."""
 
-    lines = [
-        f"**Pérdida de visibilidad (Impression Share)**",
-        f"",
-    ]
+    if value is None or pd.isna(value):
+        return "—"
+    pct = float(value) * 100
+    sign = "+" if pct > 0 else ""
+    return f"{sign}{pct:.1f}%".replace(".", ",")
 
-    is_drop = [f for f in benchmark_findings if "impression_share" in f.rule_id.lower() or "impr_share" in f.rule_id.lower()]
 
-    if is_drop:
-        lines.append(f"🔴 **Campañas perdiendo cuota de impresiones vs benchmark histórico**:")
-        for f in is_drop:
-            lines.append(f"   - {f.message}")
+def _rate_text(value) -> str:
+    """Formatea una tasa. Usa dos decimales cuando el valor es menor a 1%."""
+
+    if value is None or pd.isna(value):
+        return "—"
+    pct = float(value) * 100 if abs(value) <= 1 else float(value)
+    decimals = 2 if abs(pct) < 1 else 1
+    return f"{pct:.{decimals}f}%".replace(".", ",")
+
+
+P5_MAX_ROWS = 3
+
+
+def _plural(count: int, singular: str, plural: str) -> str:
+    return singular if count == 1 else plural
+
+
+def _conversions_text(value: float) -> str:
+    """Formatea conversiones: sin decimales si son enteras."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    decimals = 0 if number.is_integer() else 1
+    return format_number(number, decimals=decimals)
+
+
+def _campaign_row_text(row: dict) -> str:
+    """Fila de la tabla de clics vs conversiones."""
+
+    return (
+        f"| **{row['campaign']}** | {format_number(row['clicks'])} | "
+        f"{_conversions_text(row['conversions'])} | {_rate_text(row['cvr'])} |"
+    )
+
+
+def _remaining_campaigns_text(rows: list[dict]) -> str:
+    """Nota con las campañas que no entraron en la tabla."""
+
+    shown = rows[:P5_MAX_ROWS]
+    detail = ", ".join(
+        f"{row['campaign']} ({_rate_text(row['cvr'])})" for row in shown
+    )
+    extra = len(rows) - len(shown)
+    more = f" y {extra} más" if extra > 0 else ""
+    return (
+        f"*{len(rows)} {_plural(len(rows), 'campaña', 'campañas')} más "
+        f"con el mismo patrón: {detail}{more}.*"
+    )
+
+
+def analyze_clicks_vs_conversions(
+    df_campaign: pd.DataFrame | None,
+    eligibility_df: pd.DataFrame | None = None,
+) -> dict:
+    """Compara la tasa de conversión de cada campaña contra el promedio de la cuenta.
+
+    La pregunta 5 no usa un benchmark externo: el promedio de la cuenta es la
+    referencia. Una campaña por debajo atrae clics que no se convierten; una
+    campaña por encima convierte más de lo que su tráfico haría esperar.
+    """
+
+    empty = {
+        "total_clicks": 0.0,
+        "total_conversions": 0.0,
+        "account_cvr": None,
+        "click_sinks": [],
+        "efficient_low_traffic": [],
+        "excluded": 0,
+        "campaigns": 0,
+    }
+
+    if df_campaign is None or df_campaign.empty:
+        return empty
+    if "campaign" not in df_campaign.columns or "clicks" not in df_campaign.columns:
+        return empty
+
+    df = df_campaign.copy()
+    df["clicks"] = pd.to_numeric(df["clicks"], errors="coerce").fillna(0.0)
+    if "conversions" in df.columns:
+        df["conversions"] = pd.to_numeric(
+            df["conversions"], errors="coerce"
+        ).fillna(0.0)
     else:
-        lines.append(f"✅ No se detectaron caídas significativas de Impression Share vs benchmark.")
+        df["conversions"] = 0.0
 
-    return "\n".join(lines)
+    mask = df["clicks"] >= MIN_CLICKS_FOR_ANALYSIS
+    if eligibility_df is not None and "is_eligible" in eligibility_df.columns:
+        eligible = set(
+            eligibility_df.loc[
+                eligibility_df["is_eligible"].astype(bool), "campaign"
+            ]
+        )
+        mask = mask & df["campaign"].isin(eligible)
+
+    analyzed = df[mask]
+    excluded = int(len(df) - len(analyzed))
+    if analyzed.empty:
+        empty["excluded"] = excluded
+        return empty
+
+    total_clicks = float(analyzed["clicks"].sum())
+    total_conversions = float(analyzed["conversions"].sum())
+    if total_clicks <= 0:
+        empty["excluded"] = excluded
+        return empty
+
+    account_cvr = total_conversions / total_clicks
+
+    campaigns = []
+    for _, row in analyzed.iterrows():
+        clicks = float(row["clicks"])
+        conversions = float(row["conversions"])
+        campaigns.append({
+            "campaign": row["campaign"],
+            "clicks": clicks,
+            "conversions": conversions,
+            "cvr": conversions / clicks if clicks > 0 else 0.0,
+        })
+
+    click_sinks = sorted(
+        [c for c in campaigns if c["cvr"] < account_cvr],
+        key=lambda campaign: campaign["clicks"],
+        reverse=True,
+    )
+    efficient = sorted(
+        [c for c in campaigns if c["cvr"] > account_cvr],
+        key=lambda campaign: campaign["cvr"],
+        reverse=True,
+    )
+
+    return {
+        "total_clicks": total_clicks,
+        "total_conversions": total_conversions,
+        "account_cvr": account_cvr,
+        "click_sinks": click_sinks,
+        "efficient_low_traffic": efficient,
+        "excluded": excluded,
+        "campaigns": len(campaigns),
+    }
+
+
+def _omitted_campaigns_text(excluded: int) -> str:
+    return (
+        f"Se omitieron **{excluded}** "
+        f"{_plural(excluded, 'campaña', 'campañas')} con menos de "
+        f"{MIN_CLICKS_FOR_ANALYSIS} clics o datos insuficientes (ver punto 6)."
+    )
 
 
 def generate_clicks_vs_conversions_insight(
-    benchmark_findings: list,
+    df_campaign: pd.DataFrame | None = None,
+    eligibility_df: pd.DataFrame | None = None,
+    analysis: dict | None = None,
 ) -> str:
-    """Pregunta 6: ¿Qué campañas atraen clics pero no logran conversiones (o al revés)?"""
+    """Pregunta 5: ¿Qué campañas atraen clics pero no logran conversiones (o al revés)?
 
-    lines = [
-        f"**Análisis clics vs conversiones (CTR / Tasa conversión)**",
-        f"",
-    ]
+    La referencia es el promedio de la cuenta, no un benchmark. Se muestran como
+    máximo tres campañas por lado; el resto se resume en una nota.
+    """
 
-    ctr_findings = [f for f in benchmark_findings if "ctr" in f.rule_id.lower()]
-    cvr_findings = [f for f in benchmark_findings if "conversion_rate" in f.rule_id.lower() or "conversions_drop" in f.rule_id.lower()]
+    if analysis is None:
+        analysis = analyze_clicks_vs_conversions(df_campaign, eligibility_df)
 
-    if ctr_findings:
-        lines.append(f"📊 **Variaciones de CTR vs benchmark**:")
-        for f in ctr_findings:
-            lines.append(f"   - {f.message}")
-        lines.append(f"")
+    lines = ["**Clics vs conversiones**", ""]
+    total_clicks = analysis["total_clicks"]
+    total_conversions = analysis["total_conversions"]
+    account_cvr = analysis["account_cvr"]
+    excluded = analysis["excluded"]
 
-    if cvr_findings:
-        lines.append(f"📊 **Variaciones de Tasa de Conversión / Conversiones vs benchmark**:")
-        for f in cvr_findings:
-            lines.append(f"   - {f.message}")
-        lines.append(f"")
+    if not analysis["campaigns"]:
+        lines.append(
+            f"No hay campañas con al menos **{MIN_CLICKS_FOR_ANALYSIS} clics** "
+            "y datos suficientes para comparar."
+        )
+        if excluded:
+            lines.append("")
+            lines.append(_omitted_campaigns_text(excluded))
+        return "\n".join(lines)
 
-    if not ctr_findings and not cvr_findings:
-        lines.append(f"✅ CTR y tasa de conversión dentro de rangos esperados vs benchmark histórico.")
+    if not account_cvr:
+        lines.append(
+            f"Se registraron **{format_number(total_clicks)} clics** pero "
+            "**ninguna conversión** en el período, así que no hay una tasa "
+            "promedio con la cual comparar."
+        )
+        lines.append("")
+        lines.append(
+            "Antes de cambiar campañas, revisar que el registro de conversiones "
+            "esté funcionando."
+        )
+        return "\n".join(lines)
+
+    lines.append(
+        f"La cuenta completa convierte **{_rate_text(account_cvr)}** de los "
+        f"clics: **{_conversions_text(total_conversions)} "
+        f"{_plural(int(total_conversions), 'conversión', 'conversiones')}** "
+        f"sobre **{format_number(total_clicks)} clics**. Ese es el promedio "
+        "contra el que se mide cada campaña."
+    )
+    lines.append("")
+
+    click_sinks = analysis["click_sinks"]
+    efficient = analysis["efficient_low_traffic"]
+
+    if not click_sinks and not efficient:
+        lines.append(
+            "✅ Todas las campañas con volumen suficiente convierten en línea "
+            "con el promedio de la cuenta."
+        )
+        if excluded:
+            lines.append("")
+            lines.append(_omitted_campaigns_text(excluded))
+        return "\n".join(lines)
+
+    if click_sinks:
+        lines.append(
+            "🔴 **Atraen clics, pero convierten por debajo del promedio** "
+            "(candidatas a revisar segmentación, oferta o landing)"
+        )
+        lines.append("")
+        lines.append("| Campaña | Clics | Conversiones | Tasa de conversión |")
+        lines.append("| --- | --- | --- | --- |")
+        for row in click_sinks[:P5_MAX_ROWS]:
+            lines.append(_campaign_row_text(row))
+        lines.append("")
+        if len(click_sinks) > P5_MAX_ROWS:
+            lines.append(_remaining_campaigns_text(click_sinks[P5_MAX_ROWS:]))
+            lines.append("")
+
+    if efficient:
+        lines.append(
+            "🟢 **Convierten por encima del promedio** "
+            "(candidatas a recibir más presupuesto)"
+        )
+        lines.append("")
+        lines.append("| Campaña | Clics | Conversiones | Tasa de conversión |")
+        lines.append("| --- | --- | --- | --- |")
+        for row in efficient[:P5_MAX_ROWS]:
+            lines.append(_campaign_row_text(row))
+        lines.append("")
+        if len(efficient) > P5_MAX_ROWS:
+            lines.append(_remaining_campaigns_text(efficient[P5_MAX_ROWS:]))
+            lines.append("")
+
+    if excluded:
+        lines.append(_omitted_campaigns_text(excluded))
+        lines.append("")
+
+    lines.append(
+        "**Tasa de conversión** = conversiones ÷ clics. El promedio de la "
+        f"cuenta es **{_rate_text(account_cvr)}**: por debajo, la campaña "
+        "recibe clics que no se convierten; por encima, convierte mejor de lo "
+        "esperado para el tráfico que recibe."
+    )
 
     return "\n".join(lines)
 
 
-def generate_high_cpa_insight(
+def _cpa_vs_reference_rows(
     df_campaign: pd.DataFrame,
-    benchmark_findings: list,
-    outlier_findings: list,
-) -> str:
-    """Pregunta 7: ¿Qué campañas tienen un costo por resultado demasiado alto?"""
+    cpa_findings: list,
+) -> list[dict]:
+    """Arma filas de CPA actual vs la referencia usada por el diagnóstico."""
+
+    benchmark_by_campaign = {f.campaign: f for f in cpa_findings}
+    rows = []
+
+    for campaign, finding in benchmark_by_campaign.items():
+        campaign_rows = df_campaign[df_campaign["campaign"] == campaign]
+        row = campaign_rows.iloc[0] if not campaign_rows.empty else None
+
+        actual_cpa = None
+        if row is not None and "cpa" in row.index and pd.notna(row["cpa"]):
+            actual_cpa = float(row["cpa"])
+        if actual_cpa is None and finding.metric_value is not None:
+            actual_cpa = float(finding.metric_value)
+
+        reference = finding.benchmark_value
+        variation = finding.variation_pct
+        if variation is None and actual_cpa is not None and reference:
+            variation = (actual_cpa - reference) / reference
+
+        conversions = None
+        spend = None
+        if row is not None:
+            if "conversions" in row.index and pd.notna(row["conversions"]):
+                conversions = float(row["conversions"])
+            if "spend_usd" in row.index and pd.notna(row["spend_usd"]):
+                spend = float(row["spend_usd"])
+
+        rows.append({
+            "campaign": campaign,
+            "cpa": actual_cpa,
+            "reference": reference,
+            "variation": variation,
+            "conversions": conversions,
+            "spend": spend,
+        })
+
+    rows.sort(
+        key=lambda item: item["cpa"] if item["cpa"] is not None else -1,
+        reverse=True,
+    )
+    return rows
+
+
+def _cpa_vs_reference_lines(
+    df_campaign: pd.DataFrame,
+    cpa_findings: list,
+) -> list[str]:
+    """Tabla de CPA vs objetivo/benchmark para el punto 3."""
+
+    rows = _cpa_vs_reference_rows(df_campaign, cpa_findings)
+    if not rows:
+        return []
 
     lines = [
-        f"**Campañas con CPA/ROAS elevado**",
-        f"",
+        "🟡 **CPA vs objetivo/benchmark**",
+        "",
+        "| Campaña | CPA actual | Referencia | Variación | Conversiones | Inversión |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
-
-    cpa_findings = [f for f in benchmark_findings if "cpa" in f.rule_id.lower()]
-    cpa_outliers = [f for f in outlier_findings if "cpa" in f.outlier_type.lower()]
-
-    if cpa_findings:
-        lines.append(f"🔴 **CPA significativamente por encima del benchmark histórico**:")
-        for f in cpa_findings:
-            lines.append(f"   - **{f.campaign}**: {f.message}")
-        lines.append(f"")
-
-    if cpa_outliers:
-        lines.append(f"🔴 **Outliers críticos de CPA** (variación >2x umbral normal):")
-        for f in cpa_outliers:
-            lines.append(f"   - **{f.campaign}**: {f.message}")
-        lines.append(f"")
-
-    # Top CPA actual
-    if "cpa" in df_campaign.columns:
-        top_cpa = df_campaign[df_campaign["cpa"].notna()].nlargest(3, "cpa")
-        if not top_cpa.empty:
-            lines.append(f"📊 **Top 3 CPA actual en la cuenta**:")
-            for _, row in top_cpa.iterrows():
-                lines.append(f"   - **{row['campaign']}**: CPA {format_currency(row['cpa'])}, {format_number(row['conversions'])} conv.")
-        lines.append(f"")
-
-    if not cpa_findings and not cpa_outliers:
-        lines.append(f"✅ No se detectaron CPAs anómalamente altos vs benchmark.")
-
-    return "\n".join(lines)
+    for item in rows:
+        lines.append(
+            f"| **{item['campaign']}** | {format_currency(item['cpa'])} | "
+            f"{format_currency(item['reference'])} | "
+            f"{_signed_percentage(item['variation'])} | "
+            f"{format_number(item['conversions'])} | "
+            f"{format_currency(item['spend'])} |"
+        )
+    lines.append("")
+    return lines
 
 
 def generate_insufficient_data_insight(
     eligibility_df: pd.DataFrame,
 ) -> str:
-    """Pregunta 8: ¿Qué campañas tienen tan pocos datos que conviene esperar?"""
+    """Pregunta 6: ¿Qué campañas tienen tan pocos datos que conviene esperar?"""
 
     lines = [
-        f"**Campañas con datos insuficientes**",
-        f"",
+        "**Campañas con datos insuficientes**",
+        "",
     ]
 
-    insufficient_hist = eligibility_df[eligibility_df["eligibility_status"] == "insufficient_history"]
-    insufficient_vol = eligibility_df[eligibility_df["eligibility_status"] == "insufficient_volume"]
+    status_labels = {
+        "insufficient_history": "Historial insuficiente",
+        "insufficient_volume": "Volumen insuficiente",
+    }
+    pending = eligibility_df[
+        eligibility_df["eligibility_status"].isin(list(status_labels))
+    ].copy()
 
-    if not insufficient_hist.empty:
-        lines.append(f"🟡 **Campañas nuevas (< 7 días activa) - esperar historial**:")
-        for _, row in insufficient_hist.iterrows():
-            lines.append(f"   - **{row['campaign']}**: {row['active_days']} días activa (mínimo 7)")
-        lines.append(f"")
+    if pending.empty:
+        lines.append(
+            "✅ Todas las campañas tienen historial y volumen suficiente para análisis."
+        )
+        return "\n".join(lines)
 
-    if not insufficient_vol.empty:
-        lines.append(f"🟡 **Campañas con volumen insuficiente para análisis confiable**:")
-        for _, row in insufficient_vol.iterrows():
-            lines.append(f"   - **{row['campaign']}**: {row['eligibility_reason']}")
-        lines.append(f"")
+    if "spend_usd" in pending.columns:
+        pending = pending.sort_values("spend_usd", ascending=False)
 
-    if insufficient_hist.empty and insufficient_vol.empty:
-        lines.append(f"✅ Todas las campañas tienen historial y volumen suficiente para análisis.")
+    lines.append("| Campaña | Estado | Días activos | Clics | Inversión |")
+    lines.append("| --- | --- | --- | --- | --- |")
+    for _, row in pending.iterrows():
+        status = status_labels.get(row["eligibility_status"], row["eligibility_status"])
+        active_days = row.get("active_days", "—")
+        if pd.isna(active_days):
+            active_days = "—"
+        clicks = row.get("clicks", None)
+        spend = row.get("spend_usd", None)
+        lines.append(
+            f"| **{row['campaign']}** | {status} | {active_days} | "
+            f"{format_number(clicks)} | {format_currency(spend)} |"
+        )
 
     return "\n".join(lines)
+
+
+def _action_for_finding(finding) -> str:
+    """Sugiere una acción concreta según el tipo de hallazgo."""
+
+    text = " ".join(
+        str(getattr(finding, attribute, "") or "")
+        for attribute in ("rule_id", "rule_name", "message")
+    ).lower()
+
+    if "display" in text or "red de display" in text:
+        return "Desactivar Red de Display o revisar segmentación"
+    if "sin clic" in text or "sin convers" in text or "spend_no" in text:
+        return "Pausar y revisar configuración/tracking"
+    if "cpa" in text:
+        return "Revisar pujas, palabras clave y segmentación"
+    if "cpc" in text:
+        return "Revisar competencia, calidad y pujas"
+    if "ctr" in text:
+        return "Revisar anuncios, palabras clave y calidad del tráfico"
+    if "conversion" in text or "tasa" in text:
+        return "Revisar landing page, oferta y tracking"
+    if "impression" in text or "impres" in text or "visibilidad" in text:
+        return "Revisar presupuesto y ranking"
+    if "pareto" in text or "concentra" in text:
+        return "Revisar distribución de presupuesto"
+    return "Revisar campaña"
 
 
 def generate_top_findings_summary(
     scored_findings: list,
 ) -> str:
-    """Pregunta 9: ¿Cuáles son los 2 a 5 hallazgos más relevantes de la semana?"""
+    """Pregunta 7: plan de acción con los hallazgos priorizados."""
 
     lines = [
-        f"**🎯 Top {len(scored_findings)} hallazgos más relevantes de la semana**",
-        f"",
+        "**🎯 Plan de acción priorizado**",
+        "",
     ]
 
-    for i, f in enumerate(scored_findings, 1):
-        severity_icon = {
-            "critical": "🔴",
-            "high": "🟠",
-            "medium": "🟡",
-            "low": "🟢",
-        }.get(f.severity.value, "⚪")
+    if not scored_findings:
+        lines.append("✅ No se generaron hallazgos prioritarios en esta corrida.")
+        return "\n".join(lines)
 
-        outlier_mark = " ⚡ OUTLIER" if f.is_outlier else ""
-        lines.append(f"**{i}. {severity_icon} {f.rule_name}** ({f.campaign}){outlier_mark}")
-        lines.append(f"   {f.message}")
-        lines.append(f"")
+    severity_meta = {
+        "critical": "🔴 Crítico",
+        "high": "🟠 Alto",
+        "medium": "🟡 Medio",
+        "low": "🟢 Bajo",
+    }
+
+    lines.append(
+        "Estas son las acciones con mayor impacto según el peso de la campaña "
+        "y la magnitud del desvío."
+    )
+    lines.append("")
+    lines.append("| # | Campaña | Qué pasó | Acción sugerida | Severidad |")
+    lines.append("| --- | --- | --- | --- | --- |")
+
+    ordered = sorted(
+        scored_findings,
+        key=lambda finding: finding.total_score,
+        reverse=True,
+    )
+    for index, finding in enumerate(ordered, 1):
+        severity = finding.severity
+        severity_key = getattr(severity, "value", severity)
+        severity_text = severity_meta.get(str(severity_key), str(severity_key))
+        what_happened = (
+            finding.message
+            or finding.rule_name
+            or finding.rule_id
+            or "—"
+        )
+        lines.append(
+            f"| {index} | **{finding.campaign}** | {what_happened} | "
+            f"{_action_for_finding(finding)} | {severity_text} |"
+        )
 
     return "\n".join(lines)
 
@@ -911,9 +1260,11 @@ def build_full_report(
     pareto_analysis,
     scored_findings: list,
     currency_info: dict,
+    benchmark_source: str | None = None,
+    benchmark_targets: dict | None = None,
 ) -> list[CampaignInsight]:
     """
-    Construye el reporte completo respondiendo las 9 preguntas del roadmap.
+    Construye el reporte completo respondiendo las 7 preguntas del roadmap.
     Retorna lista de CampaignInsight (uno por pregunta).
     """
 
@@ -927,7 +1278,6 @@ def build_full_report(
     display_findings = [f for f in diagnostics_findings if "display" in f.rule_id.lower()]
     benchmark_findings = [f for f in diagnostics_findings if "benchmark" in f.rule_id.lower() or "impression_share" in f.rule_id.lower()]
     spend_no_results = [f for f in outlier_findings if "spend_no" in f.outlier_type.lower()]
-    cpa_outliers = [f for f in outlier_findings if "cpa" in f.outlier_type.lower()]
 
     insights = []
 
@@ -960,6 +1310,7 @@ def build_full_report(
 
     # Pregunta 3
     network_available = "network" in df_daily.columns
+    cpa_findings = [f for f in benchmark_findings if "cpa" in f.rule_id.lower()]
     low_volume_flagged = eligibility_df[
         (eligibility_df["eligibility_status"] == "insufficient_volume") &
         (eligibility_df["is_eligible"] == False)
@@ -983,7 +1334,7 @@ def build_full_report(
     )
     if confirmed_waste:
         waste_status = "critical"
-    elif inefficiency or not low_volume_flagged.empty:
+    elif inefficiency or cpa_findings or not low_volume_flagged.empty:
         waste_status = "warning"
     else:
         waste_status = "ok"
@@ -1001,6 +1352,7 @@ def build_full_report(
             network_available=network_available,
             df_daily=df_daily,
             analysis=waste_analysis,
+            cpa_findings=cpa_findings,
         ),
         supporting_data={
             "display_findings": display_findings,
@@ -1008,71 +1360,58 @@ def build_full_report(
             "network_zero_conversion": waste_analysis["network_zero_conversion"],
             "cpa_inefficient": waste_analysis["cpa_inefficient"],
             "network_inefficient": waste_analysis["network_inefficient"],
+            "cpa_findings": cpa_findings,
             "budget_opportunities": waste_analysis["budget_opportunities"],
             "median_cpa": waste_analysis["median_cpa"],
         },
         chart_type="network_breakdown",
     ))
 
-    # Pregunta 4
-    scale_opportunities = waste_analysis["budget_opportunities"]
+    # Pregunta 4: presupuesto y visibilidad (fusión de los antiguos puntos 4 y 5)
+    budget_opportunities = waste_analysis["budget_opportunities"]
     insights.append(CampaignInsight(
         question_number=4,
-        question="¿Qué campañas tienen buen resultado y podrían recibir más presupuesto?",
-        title="Campañas a las que conviene darles más presupuesto",
-        status="ok" if scale_opportunities else "info",
-        answer=generate_scale_opportunities(
-            scale_opportunities,
-            waste_analysis["median_cpa"],
+        question="¿Qué campañas pierden visibilidad por límite de presupuesto?",
+        title="Cuota de impresiones perdida por presupuesto",
+        status="ok" if budget_opportunities else "info",
+        answer=generate_budget_visibility_insight(
+            budget_opportunities,
             budget_data_available=waste_analysis["budget_data_available"],
         ),
-        supporting_data={"budget_opportunities": scale_opportunities},
-        chart_type="scatter_cpa_conversions",
+        supporting_data={
+            "budget_opportunities": budget_opportunities,
+        },
+        chart_type=None,
     ))
 
     # Pregunta 5
-    is_drop = [f for f in benchmark_findings if "impression_share" in f.rule_id.lower() or "impr_share" in f.rule_id.lower()]
+    clicks_analysis = analyze_clicks_vs_conversions(df_campaign, eligibility_df)
+    click_sinks = clicks_analysis["click_sinks"]
+    efficient_campaigns = clicks_analysis["efficient_low_traffic"]
     insights.append(CampaignInsight(
         question_number=5,
-        question="¿Qué campañas están perdiendo visibilidad frente a la competencia?",
-        title="Pérdida de visibilidad frente a la competencia",
-        status="warning" if is_drop else "ok",
-        answer=generate_visibility_loss_insight(benchmark_findings),
-        supporting_data={"impression_share_findings": [f for f in benchmark_findings if "impr" in f.rule_id.lower()]},
-        chart_type="impression_share_trend",
-    ))
-
-    # Pregunta 6
-    ctr_findings = [f for f in benchmark_findings if "ctr" in f.rule_id.lower()]
-    cvr_findings = [f for f in benchmark_findings if "conversion_rate" in f.rule_id.lower() or "conversions_drop" in f.rule_id.lower()]
-    insights.append(CampaignInsight(
-        question_number=6,
         question="¿Qué campañas atraen clics pero no logran conversiones (o al revés)?",
         title="Clics que no se convierten (y viceversa)",
-        status="warning" if (ctr_findings or cvr_findings) else "ok",
-        answer=generate_clicks_vs_conversions_insight(benchmark_findings),
-        supporting_data={"ctr_findings": ctr_findings},
+        status=(
+            "warning"
+            if click_sinks
+            else ("info" if efficient_campaigns else "ok")
+        ),
+        answer=generate_clicks_vs_conversions_insight(analysis=clicks_analysis),
+        supporting_data={
+            "account_cvr": clicks_analysis["account_cvr"],
+            "click_sinks": click_sinks,
+            "efficient_low_traffic": efficient_campaigns,
+        },
         chart_type="ctr_vs_cvr_matrix",
     ))
 
-    # Pregunta 7
-    cpa_findings = [f for f in benchmark_findings if "cpa" in f.rule_id.lower()]
-    insights.append(CampaignInsight(
-        question_number=7,
-        question="¿Qué campañas tienen un costo por resultado demasiado alto?",
-        title="Campañas con costo por resultado elevado",
-        status="critical" if (cpa_findings or cpa_outliers) else "ok",
-        answer=generate_high_cpa_insight(df_campaign, benchmark_findings, cpa_outliers),
-        supporting_data={"cpa_findings": cpa_outliers},
-        chart_type="cpa_ranking",
-    ))
-
-    # Pregunta 8
+    # Pregunta 6 (antes 7)
     insufficient_count = len(
         eligibility_df[eligibility_df["eligibility_status"].isin(["insufficient_volume", "insufficient_history"])]
     )
     insights.append(CampaignInsight(
-        question_number=8,
+        question_number=6,
         question="¿Qué campañas tienen tan pocos datos que conviene esperar antes de sacar conclusiones?",
         title="Campañas con pocos datos: esperar antes de decidir",
         status="warning" if insufficient_count else "ok",
@@ -1081,11 +1420,11 @@ def build_full_report(
         chart_type=None,
     ))
 
-    # Pregunta 9
+    # Pregunta 7 (antes 8)
     insights.append(CampaignInsight(
-        question_number=9,
-        question="¿Cuáles son los 2 a 5 hallazgos más relevantes de la semana?",
-        title="Los 2 a 5 hallazgos más importantes de la semana",
+        question_number=7,
+        question="¿Qué acciones conviene priorizar esta semana?",
+        title="Plan de acción priorizado",
         status="critical" if any(getattr(f, "is_outlier", False) for f in scored_findings) else "info",
         answer=generate_top_findings_summary(scored_findings),
         supporting_data={"scored_findings": scored_findings},
@@ -1126,7 +1465,7 @@ def generate_template_executive_summary(
 ) -> str:
     """
     Genera resumen ejecutivo narrativo usando templates locales (sin IA).
-    Estructura obligatoria siguiendo las 9 preguntas del roadmap.
+    Estructura obligatoria siguiendo las 7 preguntas del roadmap.
     """
     # Extraer KPIs globales
     total_spend = df_campaign["spend_usd"].sum()
@@ -1147,6 +1486,12 @@ def generate_template_executive_summary(
 
     def extract_msg(insights_list, max_chars=120):
         return "; ".join([getattr(i, "answer", "")[:max_chars] for i in insights_list[:3]])
+
+    def insight_by_number(number):
+        for ins in insights:
+            if getattr(ins, "question_number", None) == number:
+                return ins
+        return None
 
     # Construir secciones
     sections = []
@@ -1191,41 +1536,45 @@ def generate_template_executive_summary(
         f"**3. DESPERDICIO**: {'; '.join(waste_parts) if waste_parts else 'Sin desperdicios detectados'}"
     )
 
-    # 4. ESCALA
-    scale = find_insights(["escalar inversión", "limitadas por presupuesto"])
+    # 4. PRESUPUESTO Y VISIBILIDAD (fusión de los antiguos 4 y 5)
+    budget_vis = insight_by_number(4)
     sections.append(
-        f"**4. ESCALA**: {extract_msg(scale) if scale else 'Sin oportunidades claras'}"
+        f"**4. PRESUPUESTO Y VISIBILIDAD**: "
+        f"{extract_msg([budget_vis]) if budget_vis else 'Sin campañas limitadas por presupuesto'}"
     )
 
-    # 5. VISIBILIDAD
-    vis = find_insights(["visibilidad", "impression share", "impr share", "cuota de impres"])
+    # 5. CLICS VS CONVERSIONES
+    clicks_conv = insight_by_number(5)
+    if clicks_conv:
+        data = getattr(clicks_conv, "supporting_data", {}) or {}
+        sinks = len(data.get("click_sinks") or [])
+        efficient = len(data.get("efficient_low_traffic") or [])
+        account_cvr = data.get("account_cvr")
+        parts = []
+        if account_cvr is not None:
+            parts.append(f"promedio de la cuenta {_rate_text(account_cvr)}")
+        if sinks:
+            parts.append(
+                f"{sinks} {'campaña' if sinks == 1 else 'campañas'} "
+                "por debajo del promedio"
+            )
+        if efficient:
+            parts.append(
+                f"{efficient} {'campaña' if efficient == 1 else 'campañas'} "
+                "por encima del promedio"
+            )
+        detail = "; ".join(parts) or "sin desbalances claros"
+        sections.append(f"**5. CLICS VS CONV**: {detail}")
+    else:
+        sections.append("**5. CLICS VS CONV**: sin datos suficientes")
+
+    # 6. DATOS INSUFICIENTES
+    insuff = insight_by_number(6)
     sections.append(
-        f"**5. VISIBILIDAD**: {extract_msg(vis) if vis else 'Sin pérdidas significativas de IS'}"
+        f"**6. DATOS INSUFICIENTES**: {extract_msg([insuff]) if insuff else 'Todas con datos suficientes'}"
     )
 
-    # 6. CLICS VS CONVERSIONES
-    ctr_f = find_insights(["ctr", "tasa de clic"])
-    cvr_f = find_insights(["tasa de convers", "conversion rate", "conversiones vs"])
-    click_conv_parts = []
-    if ctr_f: click_conv_parts.append(f"CTR: {len(ctr_f)} variación(es)")
-    if cvr_f: click_conv_parts.append(f"Tasa conv: {len(cvr_f)} variación(es)")
-    sections.append(
-        f"**6. CLICS VS CONV**: {'; '.join(click_conv_parts) if click_conv_parts else 'CTR y tasa conv en rangos normales'}"
-    )
-
-    # 7. CPA ALTO
-    cpa_f = find_insights(["cpa alto", "cpa elevad", "costo por resultado", "sobre benchmark"])
-    sections.append(
-        f"**7. CPA ALTO**: {extract_msg(cpa_f) if cpa_f else 'CPAs en rangos normales'}"
-    )
-
-    # 8. DATOS INSUFICIENTES
-    insuff = find_insights(["insuficiente", "esperar", "pocos datos"])
-    sections.append(
-        f"**8. DATOS INSUFICIENTES**: {extract_msg(insuff) if insuff else 'Todas con datos suficientes'}"
-    )
-
-    # 9. TOP HALLAZGOS
+    # 7. PLAN DE ACCIÓN
     if scored_findings:
         findings_text = []
         for i, f in enumerate(scored_findings[:5], 1):
@@ -1234,12 +1583,12 @@ def generate_template_executive_summary(
                 f"{i}. {f.rule_name} ({f.campaign}){outlier}: {f.message[:120]}"
             )
         sections.append(
-            "**9. TOP 5 HALLAZGOS**:\n" + "\n".join(findings_text)
+            "**7. PLAN DE ACCIÓN**:\n" + "\n".join(findings_text)
         )
     else:
-        top_h = find_insights(["top ", "hallazg", "relevant"])
+        top_h = find_insights(["plan de acción", "hallazg", "relevant"])
         sections.append(
-            f"**9. TOP HALLAZGOS**: {extract_msg(top_h) if top_h else 'Ver lista completa'}"
+            f"**7. PLAN DE ACCIÓN**: {extract_msg(top_h) if top_h else 'Ver lista completa'}"
         )
 
     return "\n\n".join(sections)
@@ -1256,16 +1605,20 @@ def build_enhanced_report(
     currency_info: dict,
     use_llm: bool = True,
     api_key: str | None = None,
+    benchmark_source: str | None = None,
+    benchmark_targets: dict | None = None,
 ) -> tuple[list[CampaignInsight], Optional[str]]:
     """
     Construye reporte completo + narrativa ejecutiva opcional con LLM (Groq).
     Retorna (insights, llm_narrative_or_none).
     """
-    # 1. Reporte base (9 preguntas)
+    # 1. Reporte base (7 preguntas)
     insights = build_full_report(
         df_campaign, df_daily, eligibility_df,
         diagnostics_findings, outlier_findings,
-        pareto_analysis, scored_findings, currency_info
+        pareto_analysis, scored_findings, currency_info,
+        benchmark_source=benchmark_source,
+        benchmark_targets=benchmark_targets,
     )
 
     # 2. Narrativa LLM (opcional, solo si está disponible y habilitado)
